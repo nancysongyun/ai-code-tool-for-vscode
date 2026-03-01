@@ -1,0 +1,159 @@
+{
+  "name": "ai-code-uploader",
+  "displayName": "AI Code Uploader",
+  "description": "智能文件引用与AI对话助手",
+  "version": "2.0.0",
+  "publisher": "ai-uploader",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nancysongyun/ai-code-tool-for-vscode.git"
+  },
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Other",
+    "Machine Learning",
+    "Visualization"
+  ],
+  "keywords": [
+    "ai",
+    "uploader",
+    "chatgpt",
+    "claude",
+    "file",
+    "reference"
+  ],
+  "activationEvents": [
+    "onView:aiUploaderPanel",
+    "onCommand:aiUploader.addSelection",
+    "onCommand:aiUploader.addFile",
+    "onCommand:aiUploader.addFolder",
+    "onCommand:aiUploader.openPanel"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "aiUploaderSidebar",
+          "title": "AI Uploader",
+          "icon": "$(file-add)"
+        }
+      ]
+    },
+    "views": {
+      "aiUploaderSidebar": [
+        {
+          "type": "webview",
+          "id": "aiUploaderPanel",
+          "name": "AI Uploader",
+          "icon": "$(file-add)"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "aiUploader.addSelection",
+        "title": "发送到AI",
+        "category": "AI Uploader",
+        "icon": "$(add)"
+      },
+      {
+        "command": "aiUploader.addFile",
+        "title": "添加文件到 AI 指令",
+        "category": "AI Uploader",
+        "icon": "$(file-add)"
+      },
+      {
+        "command": "aiUploader.openPanel",
+        "title": "打开 AI Uploader 面板",
+        "category": "AI Uploader"
+      },
+      {
+        "command": "aiUploader.clearAll",
+        "title": "清空所有",
+        "category": "AI Uploader",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "aiUploader.addFolder",
+        "title": "发送到AI（目录）",
+        "category": "AI Uploader",
+        "icon": "$(folder-add)"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "aiUploader.addSelection",
+          "when": "editorHasSelection",
+          "group": "9_cutcopypaste@5"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "aiUploader.addFile",
+          "when": "explorerResourceIsFile",
+          "group": "2_workspace@10"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "aiUploader.clearAll",
+          "when": "view == aiUploaderPanel",
+          "group": "navigation@1"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "aiUploader.addSelection",
+        "key": "ctrl+shift+a",
+        "mac": "cmd+shift+a",
+        "when": "editorHasSelection"
+      }
+    ],
+    "configuration": {
+      "title": "AI Uploader",
+      "properties": {
+        "aiUploader.chromePort": {
+          "type": "number",
+          "default": 9222,
+          "description": "Chrome 远程调试端口"
+        },
+        "aiUploader.defaultUrl": {
+          "type": "string",
+          "default": "https://kimi.moonshot.cn",
+          "description": "默认 AI 对话平台 URL"
+        },
+        "aiUploader.autoInsertFileRef": {
+          "type": "boolean",
+          "default": true,
+          "description": "自动在指令顶部插入文件引用"
+        },
+        "aiUploader.showLineNumbers": {
+          "type": "boolean",
+          "default": true,
+          "description": "在文件引用中显示行号"
+        },
+        "aiUploader.confirmBeforeSend": {
+          "type": "boolean",
+          "default": false,
+          "description": "发送前弹出确认框预览完整指令"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^18.x",
+    "@types/vscode": "^1.74.0",
+    "typescript": "^4.9.4"
+  }
+}

@@ -1,0 +1,1016 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--vscode-foreground);
+    background: var(--vscode-editor-background);
+    padding: 12px;
+}
+
+.container {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+/* Header */
+.header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.header h2 {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--vscode-foreground);
+}
+
+.file-count {
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+    background: var(--vscode-badge-background);
+    padding: 2px 8px;
+    border-radius: 10px;
+}
+
+/* Instructions */
+.instructions {
+    background: var(--vscode-editor-inactiveSelectionBackground);
+    padding: 10px;
+    border-radius: 6px;
+    font-size: 12px;
+}
+
+.instructions p {
+    margin: 4px 0;
+    color: var(--vscode-descriptionForeground);
+}
+
+/* File List */
+.file-list {
+    min-height: 100px;
+    max-height: 300px;
+    overflow-y: auto;
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 6px;
+    padding: 8px;
+    transition: all 0.2s ease;
+}
+
+/* 拖拽悬停时的视觉反馈 */
+.file-list.drag-over {
+    border: 2px dashed var(--vscode-focusBorder);
+    background: var(--vscode-editor-inactiveSelectionBackground);
+    box-shadow: inset 0 0 20px rgba(0, 0, 0, 0.1);
+}
+
+.file-list.drag-over .empty-state {
+    color: var(--vscode-focusBorder);
+}
+
+.file-list.drag-over .empty-state .hint::after {
+    content: ' - 释放以添加文件';
+    font-weight: 600;
+}
+
+.empty-state {
+    text-align: center;
+    padding: 30px 20px;
+    color: var(--vscode-descriptionForeground);
+    transition: all 0.2s ease;
+}
+
+.empty-state .hint {
+    font-size: 11px;
+    margin-top: 8px;
+    opacity: 0.7;
+}
+
+.file-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    margin-bottom: 4px;
+    background: var(--vscode-list-hoverBackground);
+    border-radius: 4px;
+    border-left: 3px solid var(--vscode-focusBorder);
+    transition: all 0.2s;
+}
+
+.file-item:hover {
+    background: var(--vscode-list-activeSelectionBackground);
+}
+
+.file-item:last-child {
+    margin-bottom: 0;
+}
+
+.file-icon {
+    font-size: 14px;
+}
+
+.file-info {
+    flex: 1;
+    min-width: 0;
+}
+
+.file-name {
+    font-weight: 500;
+    font-size: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.file-meta {
+    font-size: 10px;
+    color: var(--vscode-descriptionForeground);
+}
+
+.file-type {
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    background: var(--vscode-badge-background);
+    color: var(--vscode-badge-foreground);
+}
+
+.file-type.selection {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+}
+
+.remove-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 4px;
+    border-radius: 3px;
+    opacity: 0.6;
+    transition: opacity 0.2s;
+}
+
+.remove-btn:hover {
+    opacity: 1;
+    background: var(--vscode-errorForeground);
+}
+
+/* File List Actions */
+.file-list-actions {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: -4px;
+    margin-bottom: 8px;
+}
+
+.btn-select-files {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 12px;
+    border: none;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    background: transparent;
+    color: var(--vscode-textLink-foreground);
+    transition: all 0.2s;
+}
+
+.btn-select-files:hover {
+    background: var(--vscode-textLink-activeForeground);
+    color: var(--vscode-editor-background);
+}
+
+/* Paste Path Section */
+.paste-path-section {
+    margin-bottom: 8px;
+}
+
+.paste-path-input-group {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+
+.paste-path-input {
+    flex: 1;
+    padding: 6px 10px;
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 4px;
+    background: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    font-size: 12px;
+    outline: none;
+    transition: border-color 0.2s;
+}
+
+.paste-path-input:focus {
+    border-color: var(--vscode-focusBorder);
+}
+
+.paste-path-input::placeholder {
+    color: var(--vscode-input-placeholderForeground);
+    font-size: 11px;
+}
+
+.btn-add-path {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: none;
+    border-radius: 4px;
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    cursor: pointer;
+    transition: all 0.2s;
+    flex-shrink: 0;
+}
+
+.btn-add-path:hover {
+    background: var(--vscode-button-hoverBackground);
+}
+
+.btn-add-path .icon {
+    font-size: 14px;
+    line-height: 1;
+}
+
+.btn-clear {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 12px;
+    border: none;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    background: transparent;
+    color: var(--vscode-errorForeground);
+    opacity: 0.8;
+    transition: all 0.2s;
+}
+
+.btn-clear:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.btn-clear:hover:not(:disabled) {
+    opacity: 1;
+    background: var(--vscode-errorForeground);
+    color: white;
+}
+
+/* Actions */
+.actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 8px;
+}
+
+.btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 10px 12px;
+    border: none;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.btn-primary {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+}
+
+.btn-primary:hover:not(:disabled) {
+    background: var(--vscode-button-hoverBackground);
+}
+
+.btn-secondary {
+    background: var(--vscode-secondaryButton-background);
+    color: var(--vscode-secondaryButton-foreground);
+}
+
+.btn-secondary:hover:not(:disabled) {
+    background: var(--vscode-secondaryButton-hoverBackground);
+}
+
+.btn-danger {
+    background: var(--vscode-errorForeground);
+    color: white;
+    opacity: 0.8;
+}
+
+.btn-danger:hover:not(:disabled) {
+    opacity: 1;
+}
+
+.icon {
+    font-size: 14px;
+}
+
+/* Preview Section */
+.preview-section {
+    margin-top: 8px;
+}
+
+.preview-section h3 {
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    color: var(--vscode-foreground);
+}
+
+/* Platform Section */
+.platform-section {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--vscode-panel-border);
+}
+
+.platform-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+}
+
+.platform-header h3 {
+    font-size: 12px;
+    font-weight: 600;
+    margin: 0;
+    color: var(--vscode-foreground);
+}
+
+.btn-manage-sites {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 10px;
+    border: none;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    background: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground);
+    transition: all 0.2s;
+}
+
+.btn-manage-sites:hover {
+    background: var(--vscode-button-secondaryHoverBackground);
+}
+
+.platform-config {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.form-group {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.form-group label {
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+    font-weight: 500;
+}
+
+.form-control {
+    padding: 6px 8px;
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 4px;
+    background: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    font-size: 12px;
+    font-family: inherit;
+    outline: none;
+    transition: border-color 0.2s;
+}
+
+.form-control:focus {
+    border-color: var(--vscode-focusBorder);
+}
+
+select.form-control {
+    cursor: pointer;
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23888' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
+    padding-right: 24px;
+}
+
+input.form-control::placeholder {
+    color: var(--vscode-input-placeholderForeground);
+}
+
+#preview {
+    width: 100%;
+    min-height: 120px;
+    max-height: 200px;
+    padding: 10px;
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 6px;
+    background: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 11px;
+    resize: vertical;
+    outline: none;
+}
+
+#preview:focus {
+    border-color: var(--vscode-focusBorder);
+}
+
+/* Preview Header */
+.preview-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.preview-header h3 {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--vscode-foreground);
+    margin: 0;
+}
+
+.btn-quick-phrases {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 10px;
+    border: none;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    background: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground);
+    transition: all 0.2s;
+}
+
+.btn-quick-phrases:hover {
+    background: var(--vscode-button-secondaryHoverBackground);
+}
+
+/* Quick Phrases Modal */
+.modal-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    opacity: 0;
+    visibility: hidden;
+    transition: all 0.2s;
+}
+
+.modal-overlay.active {
+    opacity: 1;
+    visibility: visible;
+}
+
+.modal-container {
+    background: var(--vscode-editor-background);
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 8px;
+    width: 90%;
+    max-width: 500px;
+    max-height: 80vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+.modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.modal-header h3 {
+    font-size: 14px;
+    font-weight: 600;
+    margin: 0;
+    color: var(--vscode-foreground);
+}
+
+.modal-close {
+    background: none;
+    border: none;
+    font-size: 18px;
+    cursor: pointer;
+    color: var(--vscode-descriptionForeground);
+    padding: 4px;
+    border-radius: 4px;
+    line-height: 1;
+}
+
+.modal-close:hover {
+    background: var(--vscode-list-hoverBackground);
+    color: var(--vscode-foreground);
+}
+
+.modal-body {
+    flex: 1;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+/* Tabs */
+.tab-header {
+    display: flex;
+    gap: 2px;
+    padding: 8px 12px 0;
+    border-bottom: 1px solid var(--vscode-panel-border);
+    overflow-x: auto;
+}
+
+.tab-btn {
+    padding: 8px 14px;
+    border: none;
+    background: transparent;
+    color: var(--vscode-descriptionForeground);
+    font-size: 12px;
+    cursor: pointer;
+    border-radius: 4px 4px 0 0;
+    white-space: nowrap;
+    transition: all 0.2s;
+}
+
+.tab-btn:hover {
+    background: var(--vscode-list-hoverBackground);
+    color: var(--vscode-foreground);
+}
+
+.tab-btn.active {
+    background: var(--vscode-list-activeSelectionBackground);
+    color: var(--vscode-list-activeSelectionForeground);
+}
+
+/* Toolbar */
+.toolbar {
+    display: flex;
+    gap: 8px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--vscode-panel-border);
+    align-items: center;
+}
+
+.toolbar-search {
+    flex: 1;
+    padding: 6px 10px;
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 4px;
+    background: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    font-size: 12px;
+    outline: none;
+}
+
+.toolbar-search:focus {
+    border-color: var(--vscode-focusBorder);
+}
+
+.toolbar-btn {
+    padding: 6px 12px;
+    border: none;
+    border-radius: 4px;
+    font-size: 11px;
+    cursor: pointer;
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    transition: all 0.2s;
+}
+
+.toolbar-btn:hover {
+    background: var(--vscode-button-hoverBackground);
+}
+
+.toolbar-btn.secondary {
+    background: var(--vscode-secondaryButton-background);
+    color: var(--vscode-secondaryButton-foreground);
+}
+
+.toolbar-btn.secondary:hover {
+    background: var(--vscode-secondaryButton-hoverBackground);
+}
+
+.toolbar-btn.danger {
+    background: var(--vscode-errorForeground);
+    color: white;
+    opacity: 0.8;
+}
+
+.toolbar-btn.danger:hover {
+    opacity: 1;
+}
+
+/* Phrases List */
+.phrases-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px;
+}
+
+.phrase-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    margin-bottom: 4px;
+    background: var(--vscode-list-hoverBackground);
+    border-radius: 4px;
+    transition: all 0.2s;
+}
+
+.phrase-item:hover {
+    background: var(--vscode-list-activeSelectionBackground);
+}
+
+.phrase-checkbox {
+    width: 16px;
+    height: 16px;
+    cursor: pointer;
+}
+
+.phrase-content {
+    flex: 1;
+    font-size: 12px;
+    color: var(--vscode-foreground);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.phrase-edit-btn,
+.phrase-add-btn {
+    padding: 4px 8px;
+    border: none;
+    border-radius: 3px;
+    font-size: 11px;
+    cursor: pointer;
+    opacity: 0;
+    transition: all 0.2s;
+    background: transparent;
+}
+
+.phrase-edit-btn {
+    color: var(--vscode-descriptionForeground);
+    font-size: 12px;
+}
+
+.phrase-add-btn {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+}
+
+.phrase-item:hover .phrase-edit-btn,
+.phrase-item:hover .phrase-add-btn {
+    opacity: 1;
+}
+
+.phrase-edit-btn:hover {
+    color: var(--vscode-foreground);
+    background: var(--vscode-list-hoverBackground);
+}
+
+.phrase-add-btn:hover {
+    background: var(--vscode-button-hoverBackground);
+}
+
+.empty-phrases {
+    text-align: center;
+    padding: 30px;
+    color: var(--vscode-descriptionForeground);
+    font-size: 12px;
+}
+
+/* Batch Add Bar */
+.batch-add-bar {
+    padding: 12px 16px;
+    border-top: 1px solid var(--vscode-panel-border);
+    background: var(--vscode-editor-background);
+}
+
+.btn-batch-add {
+    width: 100%;
+    padding: 12px;
+    border: none;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    transition: all 0.2s;
+}
+
+.btn-batch-add:hover {
+    background: var(--vscode-button-hoverBackground);
+}
+
+.btn-batch-add:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* Multi-select mode */
+.phrase-item.multi-select {
+    cursor: pointer;
+}
+
+.phrase-item.multi-select:hover {
+    background: var(--vscode-list-activeSelectionBackground);
+}
+
+/* Sites Management */
+.modal-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.sites-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px;
+}
+
+.empty-sites {
+    text-align: center;
+    padding: 30px;
+    color: var(--vscode-descriptionForeground);
+    font-size: 12px;
+}
+
+.site-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 12px;
+    margin-bottom: 6px;
+    background: var(--vscode-list-hoverBackground);
+    border-radius: 6px;
+    transition: all 0.2s;
+}
+
+.site-item:hover {
+    background: var(--vscode-list-activeSelectionBackground);
+}
+
+.site-info {
+    flex: 1;
+    min-width: 0;
+}
+
+.site-name {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--vscode-foreground);
+    margin-bottom: 2px;
+}
+
+.site-url {
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.site-actions {
+    display: flex;
+    gap: 6px;
+    opacity: 0;
+    transition: opacity 0.2s;
+}
+
+.site-item:hover .site-actions {
+    opacity: 1;
+}
+
+.site-edit-btn,
+.site-delete-btn {
+    padding: 4px 8px;
+    border: none;
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
+    background: transparent;
+    transition: all 0.2s;
+    opacity: 0;
+}
+
+.site-item:hover .site-edit-btn,
+.site-item:hover .site-delete-btn {
+    opacity: 1;
+}
+
+.site-edit-btn:hover {
+    background: var(--vscode-list-hoverBackground);
+}
+
+.site-delete-btn:hover {
+    background: var(--vscode-errorForeground);
+    color: white;
+}
+
+.add-site-form {
+    padding: 16px;
+    border-top: 1px solid var(--vscode-panel-border);
+    background: var(--vscode-editor-background);
+}
+
+.add-site-form h4 {
+    font-size: 13px;
+    margin: 0 0 12px 0;
+    color: var(--vscode-foreground);
+}
+
+.add-site-form .form-group {
+    margin-bottom: 12px;
+}
+
+.add-site-form .form-group label {
+    display: block;
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+    margin-bottom: 4px;
+}
+
+.add-site-form .form-control {
+    width: 100%;
+}
+
+.add-site-form .form-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    margin-top: 16px;
+}
+
+.add-site-form .form-actions button {
+    padding: 8px 16px;
+    border: none;
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.add-site-form .form-actions .btn-primary {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+}
+
+.add-site-form .form-actions .btn-primary:hover {
+    background: var(--vscode-button-hoverBackground);
+}
+
+.add-site-form .form-actions .btn-secondary {
+    background: var(--vscode-secondaryButton-background);
+    color: var(--vscode-secondaryButton-foreground);
+}
+
+.add-site-form .form-actions .btn-secondary:hover {
+    background: var(--vscode-secondaryButton-hoverBackground);
+}
+
+.add-site-form .form-actions .btn-danger {
+    background: var(--vscode-errorForeground);
+    color: white;
+    opacity: 0.8;
+}
+
+.add-site-form .form-actions .btn-danger:hover {
+    opacity: 1;
+}
+
+/* Add Phrase Form */
+.add-phrase-form {
+    padding: 12px;
+    border-top: 1px solid var(--vscode-panel-border);
+    display: none;
+}
+
+.add-phrase-form.active {
+    display: block;
+}
+
+.add-phrase-form h4 {
+    font-size: 12px;
+    margin: 0 0 10px 0;
+    color: var(--vscode-foreground);
+}
+
+.add-phrase-form .form-group {
+    margin-bottom: 10px;
+}
+
+.add-phrase-form .form-group label {
+    display: block;
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+    margin-bottom: 4px;
+}
+
+.add-phrase-form .form-control {
+    width: 100%;
+}
+
+.add-phrase-form .form-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
+
+.add-phrase-form .form-actions .btn-danger {
+    background: var(--vscode-errorForeground);
+    color: white;
+    opacity: 0.8;
+    margin-right: auto;
+}
+
+.add-phrase-form .form-actions .btn-danger:hover {
+    opacity: 1;
+}
+
+.add-phrase-form .form-actions button {
+    padding: 6px 14px;
+    border: none;
+    border-radius: 4px;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.add-phrase-form .form-actions .btn-primary {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+}
+
+.add-phrase-form .form-actions .btn-secondary {
+    background: var(--vscode-secondaryButton-background);
+    color: var(--vscode-secondaryButton-foreground);
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--vscode-scrollbarSlider-background);
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--vscode-scrollbarSlider-hoverBackground);
+}

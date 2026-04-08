@@ -1,3 +1,4 @@
+import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
@@ -39,6 +40,67 @@ const DEFAULT_PLATFORM_PRESETS: PlatformConfig[] = [
     { platform: '通义千问', url: 'https://tongyi.aliyun.com' }
 ];
 
+interface BatchExportSettings {
+    exportMdEnabled: boolean;
+}
+
+interface ExportManifestEntry {
+    exportedRelativePath: string;
+    originalPath: string;
+}
+
+interface ExportManifest {
+    timestamp: string;
+    rootPath: string;
+    createdAt: string;
+    entries: ExportManifestEntry[];
+    mdFile?: string;
+}
+
+interface LatestExportSession {
+    timestamp: string;
+    rootPath: string;
+    exportDir: string;
+    manifestPath: string;
+}
+
+interface McpServerConfig {
+    command: string;
+    args: string[];
+    enabled: boolean;
+    locked?: boolean;
+}
+
+interface McpConfigState {
+    mcpServers: Record<string, McpServerConfig>;
+    executor: string;
+}
+
+interface McpToolInfo {
+    name: string;
+}
+
+interface McpRuntimeSummary {
+    status: 'stopped' | 'starting' | 'ready' | 'error';
+    lastError?: string;
+}
+
+interface McpRuntimeState extends McpRuntimeSummary {
+    client?: StdioMcpClient;
+    startPromise?: Promise<StdioMcpClient | undefined>;
+}
+
+const BATCH_EXPORT_SETTINGS_KEY = 'aiUploaderBatchExportSettings';
+const LATEST_EXPORT_SESSIONS_KEY = 'aiUploaderLatestExportSessions';
+const MCP_CONFIG_KEY = 'aiUploaderMcpConfig';
+const BUILTIN_CHROME_MCP_NAME = 'chrome-devtools';
+const BUILTIN_CHROME_MCP_CONFIG: McpServerConfig = {
+    command: 'npx',
+    args: ['-y', 'chrome-devtools-mcp@latest', '--autoConnect'],
+    enabled: true,
+    locked: true
+};
+
 export class AIPanelProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'aiUploaderPanel';
 
@@ -47,6 +109,9 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
     private _context: vscode.ExtensionContext;
     private _platformConfig: PlatformConfig;
     private _platformPresets: PlatformConfig[] = [];
+    private _batchExportSettings: BatchExportSettings;
+    private _mcpConfig: McpConfigState;
+    private _mcpRuntimes: Record<string, McpRuntimeState> = {};
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -55,6 +120,15 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
         this._context = context;
         this._platformPresets = this._loadPlatformPresets();
         this._platformConfig = this._loadPlatformConfig();
+        this._batchExportSettings = this._loadBatchExportSettings();
+        this._mcpConfig = this._loadMcpConfig();
+
+        if (!this._context.globalState.get(BATCH_EXPORT_SETTINGS_KEY)) {
+            void this._context.globalState.update(BATCH_EXPORT_SETTINGS_KEY, this._batchExportSettings);
+        }
+        if (!this._context.globalState.get(MCP_CONFIG_KEY)) {
+            void this._context.globalState.update(MCP_CONFIG_KEY, this._mcpConfig);
+        }
     }
 
     // 默认快捷用语分类
@@ -146,6 +220,312 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
         }
     }
 
+    private _loadBatchExportSettings(): BatchExportSettings {
+        const settings = this._context.globalState.get<BatchExportSettings>(BATCH_EXPORT_SETTINGS_KEY);
+        return {
+            exportMdEnabled: settings?.exportMdEnabled === true
+        };
+    }
+
+    private async _saveBatchExportSettings(settings: BatchExportSettings): Promise<void> {
+        this._batchExportSettings = {
+            exportMdEnabled: settings.exportMdEnabled === true
+        };
+        await this._context.globalState.update(BATCH_EXPORT_SETTINGS_KEY, this._batchExportSettings);
+        this._sendBatchExportSettings();
+    }
+
+    private _sendBatchExportSettings() {
+        if (this._view) {
+            this._view.webview.postMessage({
+                type: 'updateBatchExportSettings',
+                settings: this._batchExportSettings
+            });
+        }
+    }
+
+    private _loadLatestExportSessions(): Record<string, LatestExportSession> {
+        return this._context.globalState.get<Record<string, LatestExportSession>>(LATEST_EXPORT_SESSIONS_KEY) || {};
+    }
+
+    private async _saveLatestExportSessions(sessions: Record<string, LatestExportSession>): Promise<void> {
+        await this._context.globalState.update(LATEST_EXPORT_SESSIONS_KEY, sessions);
+    }
+
+    private _normalizeMcpConfig(config?: Partial<McpConfigState>): McpConfigState {
+        const normalizedServers: Record<string, McpServerConfig> = {};
+        const sourceServers = config?.mcpServers || {};
+
+        for (const [name, server] of Object.entries(sourceServers)) {
+            if (!server || typeof server.command !== 'string' || !server.command.trim()) {
+                continue;
+            }
+            const args = Array.isArray(server.args) ? server.args.filter(arg => typeof arg === 'string') : [];
+            normalizedServers[name] = {
+                command: server.command,
+                args,
+                enabled: server.enabled !== false,
+                locked: server.locked === true
+            };
+        }
+
+        normalizedServers[BUILTIN_CHROME_MCP_NAME] = {
+            ...BUILTIN_CHROME_MCP_CONFIG,
+            enabled: true,
+            locked: true
+        };
+
+        const valid = new Set(Object.keys(normalizedServers));
+        for (const name of Object.keys(this._mcpRuntimes)) {
+            if (!valid.has(name)) {
+                delete this._mcpRuntimes[name];
+            }
+        }
+
+        const requestedExecutor = config?.executor;
+        const executor = requestedExecutor && normalizedServers[requestedExecutor]
+            ? requestedExecutor
+            : BUILTIN_CHROME_MCP_NAME;
+
+        return {
+            mcpServers: normalizedServers,
+            executor
+        };
+    }
+
+    private _getMcpRuntimeSummary(name: string): McpRuntimeSummary {
+        const runtime = this._mcpRuntimes[name];
+        if (!runtime) {
+            return { status: 'stopped' };
+        }
+
+        return {
+            status: runtime.status,
+            lastError: runtime.lastError
+        };
+    }
+
+    private _getReadyMcpClient(name: string): StdioMcpClient | undefined {
+        const runtime = this._mcpRuntimes[name];
+        if (runtime && runtime.status === 'ready') {
+            return runtime.client;
+        }
+        return undefined;
+    }
+
+    private _sendMcpRuntimeStatus(): void {
+        if (!this._view) {
+            return;
+        }
+
+        const runtimeSummary: Record<string, McpRuntimeSummary> = {};
+        for (const name of Object.keys(this._mcpConfig.mcpServers)) {
+            runtimeSummary[name] = this._getMcpRuntimeSummary(name);
+        }
+
+        this._view.webview.postMessage({
+            type: 'updateMcpRuntimeStatus',
+            runtime: runtimeSummary
+        });
+    }
+
+    private async _ensureMcpRuntime(name: string, server: McpServerConfig): Promise<StdioMcpClient | undefined> {
+        if (!server.enabled) {
+            this._mcpRuntimes[name] = { status: 'error', lastError: 'Server disabled' };
+            this._sendMcpRuntimeStatus();
+            return undefined;
+        }
+
+        let runtime = this._mcpRuntimes[name];
+        if (!runtime) {
+            runtime = { status: 'stopped' };
+            this._mcpRuntimes[name] = runtime;
+        }
+
+        if (runtime.status === 'ready' && runtime.client) {
+            return runtime.client;
+        }
+
+        if (runtime.status === 'starting' && runtime.startPromise) {
+            return runtime.startPromise;
+        }
+
+        runtime.status = 'starting';
+        runtime.lastError = undefined;
+        this._sendMcpRuntimeStatus();
+
+        const startPromise = (async () => {
+            const client = new StdioMcpClient(server.command, server.args, () => {
+                const target = this._mcpRuntimes[name];
+                if (target) {
+                    target.status = 'stopped';
+                    target.client = undefined;
+                    this._sendMcpRuntimeStatus();
+                }
+            });
+
+            try {
+                await client.start();
+                await client.initialize();
+                runtime.client = client;
+                runtime.status = 'ready';
+                runtime.lastError = undefined;
+                return client;
+            } catch (error) {
+                runtime.status = 'error';
+                runtime.lastError = String(error);
+                runtime.client = undefined;
+                return undefined;
+            } finally {
+                runtime.startPromise = undefined;
+                this._sendMcpRuntimeStatus();
+            }
+        })();
+
+        runtime.startPromise = startPromise;
+        return startPromise;
+    }
+
+    private async _startMcpServer(name: string): Promise<void> {
+        const server = this._mcpConfig.mcpServers[name];
+        if (!server) {
+            return;
+        }
+
+        const client = await this._ensureMcpRuntime(name, server);
+        if (client) {
+            vscode.window.showInformationMessage(`MCP ${name} 已启动`);
+        } else {
+            vscode.window.showWarningMessage(`无法启动 MCP ${name}，请检查配置`);
+        }
+    }
+
+
+    private _loadMcpConfig(): McpConfigState {
+        const stored = this._context.globalState.get<McpConfigState>(MCP_CONFIG_KEY);
+        return this._normalizeMcpConfig(stored);
+    }
+
+    private async _saveMcpConfig(config: McpConfigState): Promise<void> {
+        this._mcpConfig = this._normalizeMcpConfig(config);
+        await this._context.globalState.update(MCP_CONFIG_KEY, this._mcpConfig);
+        this._sendMcpConfig();
+    }
+
+    private _sendMcpConfig() {
+        if (this._view) {
+            this._view.webview.postMessage({
+                type: 'updateMcpConfig',
+                config: this._mcpConfig
+            });
+        }
+        this._sendMcpRuntimeStatus();
+    }
+
+    private async _addMcpServersByJson(rawJson: string): Promise<void> {
+        if (!rawJson || !rawJson.trim()) {
+            vscode.window.showWarningMessage('Please input a valid MCP JSON config');
+            return;
+        }
+
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(rawJson);
+        } catch (error) {
+            vscode.window.showErrorMessage('Failed to parse MCP JSON: ' + String(error));
+            return;
+        }
+
+        if (!parsed || typeof parsed !== 'object' || !('mcpServers' in parsed)) {
+            vscode.window.showErrorMessage('Invalid JSON format: missing mcpServers object');
+            return;
+        }
+
+        const candidateServers = (parsed as { mcpServers?: Record<string, Partial<McpServerConfig>> }).mcpServers;
+        if (!candidateServers || typeof candidateServers !== 'object') {
+            vscode.window.showErrorMessage('Invalid JSON format: mcpServers must be an object');
+            return;
+        }
+
+        const nextConfig: McpConfigState = {
+            mcpServers: { ...this._mcpConfig.mcpServers },
+            executor: this._mcpConfig.executor
+        };
+
+        let addCount = 0;
+        for (const [name, server] of Object.entries(candidateServers)) {
+            if (!server || typeof server.command !== 'string' || !server.command.trim()) {
+                continue;
+            }
+            if (name === BUILTIN_CHROME_MCP_NAME) {
+                continue;
+            }
+
+            const args = Array.isArray(server.args) ? server.args.filter(arg => typeof arg === 'string') : [];
+            nextConfig.mcpServers[name] = {
+                command: server.command,
+                args,
+                enabled: server.enabled !== false,
+                locked: false
+            };
+            addCount++;
+        }
+
+        if (addCount === 0) {
+            vscode.window.showWarningMessage('No valid MCP server config found to add');
+            return;
+        }
+
+        await this._saveMcpConfig(nextConfig);
+        vscode.window.showInformationMessage('Saved ' + addCount + ' MCP server entries');
+    }
+
+    private async _updateMcpServerEnabled(name: string, enabled: boolean): Promise<void> {
+        const server = this._mcpConfig.mcpServers[name];
+        if (!server) {
+            return;
+        }
+
+        if (server.locked || name === BUILTIN_CHROME_MCP_NAME) {
+            vscode.window.showWarningMessage('Built-in chrome-devtools MCP is always enabled and cannot be disabled');
+            this._sendMcpConfig();
+            return;
+        }
+
+        const nextConfig: McpConfigState = {
+            mcpServers: { ...this._mcpConfig.mcpServers },
+            executor: this._mcpConfig.executor
+        };
+        nextConfig.mcpServers[name] = {
+            ...server,
+            enabled
+        };
+
+        if (!enabled && nextConfig.executor === name) {
+            nextConfig.executor = BUILTIN_CHROME_MCP_NAME;
+        }
+
+        await this._saveMcpConfig(nextConfig);
+    }
+
+    private async _setMcpExecutor(name: string): Promise<void> {
+        const server = this._mcpConfig.mcpServers[name];
+        if (!server) {
+            return;
+        }
+
+        if (!server.enabled && name !== BUILTIN_CHROME_MCP_NAME) {
+            vscode.window.showWarningMessage('Please enable this MCP server before setting it as executor');
+            return;
+        }
+
+        const nextConfig: McpConfigState = {
+            mcpServers: { ...this._mcpConfig.mcpServers },
+            executor: name
+        };
+        await this._saveMcpConfig(nextConfig);
+    }
+
     public resolveWebviewView(
         webviewView: vscode.WebviewView,
         context: vscode.WebviewViewResolveContext,
@@ -171,13 +551,13 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
                     await this._copyToClipboard(data.content);
                     break;
                 case 'openBrowser':
-                    await this._openBrowser();
+                    await this._openBrowser(data.content);
                     break;
                 case 'exportFiles':
                     await this._exportFiles(data.content);
                     break;
                 case 'batchExportFiles':
-                    await this._batchExportFiles();
+                    await this._batchExportFiles(data.content, data.exportMdEnabled);
                     break;
                 case 'clearAll':
                     this.clearAll();
@@ -204,7 +584,7 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
                     await this._selectFilesFromWorkspace();
                     break;
                 case 'dropFiles':
-                    await this._handleDroppedFiles(data.files);
+                    await this._handleDroppedFiles(data.files || data.uris || []);
                     break;
                 case 'getQuickPhrases':
                     this._sendQuickPhrases();
@@ -230,6 +610,27 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
                 case 'addFilesByPath':
                     await this._addFilesByPath(data.paths);
                     break;
+                case 'getBatchExportSettings':
+                    this._sendBatchExportSettings();
+                    break;
+                case 'updateBatchExportSettings':
+                    await this._saveBatchExportSettings(data.settings || { exportMdEnabled: data.exportMdEnabled === true });
+                    break;
+                case 'getMcpConfig':
+                    this._sendMcpConfig();
+                    break;
+                case 'addMcpServersByJson':
+                    await this._addMcpServersByJson(data.json);
+                    break;
+                case 'updateMcpServerEnabled':
+                    await this._updateMcpServerEnabled(data.name, data.enabled === true);
+                    break;
+                case 'setMcpExecutor':
+                    await this._setMcpExecutor(data.name);
+                    break;
+                case 'startMcpServer':
+                    await this._startMcpServer(data.name);
+                    break;
             }
         });
 
@@ -237,6 +638,8 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
         this._updateFileList();
         this._sendPlatformConfig();
         this._sendQuickPhrases();
+        this._sendBatchExportSettings();
+        this._sendMcpConfig();
     }
 
     // 发送快捷用语到 webview
@@ -276,10 +679,10 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
         const phrases = this._loadQuickPhrases();
         const filtered = phrases.filter(p => !ids.includes(p.id));
         await this._saveQuickPhrases(filtered);
-        
+
         // 清理空分类
         await this._cleanupEmptyCategories();
-        
+
         this._sendQuickPhrases();
     }
 
@@ -309,15 +712,15 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
     private async _cleanupEmptyCategories(): Promise<void> {
         const categories = this._loadCategories();
         const phrases = this._loadQuickPhrases();
-        
+
         // 找出有指令的分类
         const categoriesWithPhrases = new Set(phrases.map(p => p.category));
-        
+
         // 保留默认分类或有指令的分类
-        const filteredCategories = categories.filter(c => 
+        const filteredCategories = categories.filter(c =>
             c.isDefault || categoriesWithPhrases.has(c.id)
         );
-        
+
         // 如果有变化则保存
         if (filteredCategories.length !== categories.length) {
             await this._saveCategories(filteredCategories);
@@ -364,13 +767,13 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
         const presets = this._loadPlatformPresets();
         const filtered = presets.filter(p => !platformNames.includes(p.platform));
         await this._savePlatformPresets(filtered);
-        
+
         // 如果当前选中的配置被删除了，切换到第一个预设
         if (platformNames.includes(this._platformConfig.platform)) {
             const newConfig = filtered[0] || DEFAULT_PLATFORM_PRESETS[0];
             await this._savePlatformConfig(newConfig);
         }
-        
+
         this._sendPlatformConfig();
     }
 
@@ -384,7 +787,7 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
                 break;
             }
         }
-        
+
         if (existingRef) {
             // 已存在相同文件，合并行号
             const existingLines = this._parseLineRanges(existingRef.lineRange);
@@ -604,54 +1007,224 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
             return;
         }
 
-        await vscode.env.clipboard.writeText(instruction);
         vscode.window.showInformationMessage('指令已复制到剪贴板！');
     }
 
     // 打开浏览器
-    private async _openBrowser(): Promise<void> {
-        const instruction = this._generateInstruction();
-        if (!instruction) {
-            vscode.window.showWarningMessage('没有可发送的文件引用');
+    private async _openBrowser(content?: string): Promise<void> {
+        const instruction = (content && content.trim()) ? content : this._generateInstruction();
+        if (!instruction || instruction.trim() === '') {
+            vscode.window.showWarningMessage('No instruction content to send');
             return;
         }
 
-        // 复制到剪贴板
-        await vscode.env.clipboard.writeText(instruction);
-
-        // 使用配置的平台 URL
         const url = this._platformConfig.url;
-        if (url) {
-            vscode.env.openExternal(vscode.Uri.parse(url));
-            vscode.window.showInformationMessage(
-                `已打开 ${this._platformConfig.platform}，请粘贴指令到输入框`
-            );
-        } else {
-            vscode.window.showWarningMessage('请先配置目标平台 URL');
+        if (!url || !url.trim()) {
+            vscode.window.showWarningMessage('Please configure a target URL first');
+            return;
+        }
+
+        const mcpSuccess = await this._openBrowserWithMcp(url, instruction);
+        if (mcpSuccess) {
+            vscode.window.showInformationMessage('Opened page and filled instruction via MCP');
+            return;
+        }
+
+        // MCP not ready: block action and prompt user to start MCP.
+        vscode.window.showWarningMessage("MCP 未就绪：请在【配置MCP】中启动 chrome-devtools-mcp 后再重试。");
+    }
+
+    private async _openBrowserWithMcp(url: string, instruction: string): Promise<boolean> {
+        const candidates = [this._mcpConfig.executor, BUILTIN_CHROME_MCP_NAME];
+        const tried = new Set<string>();
+
+        for (const name of candidates) {
+            if (!name || tried.has(name)) {
+                continue;
+            }
+            tried.add(name);
+
+            const server = this._mcpConfig.mcpServers[name];
+            if (!server) {
+                continue;
+            }
+            if (!server.enabled && name !== BUILTIN_CHROME_MCP_NAME) {
+                continue;
+            }
+
+            const success = await this._tryOpenBrowserWithMcpServer(name, server, url, instruction);
+            if (success) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private async _tryOpenBrowserWithMcpServer(
+        serverName: string,
+        server: McpServerConfig,
+        url: string,
+        instruction: string
+    ): Promise<boolean> {
+        const client = this._getReadyMcpClient(serverName);
+        if (!client) {
+            return false;
+        }
+
+        try {
+            const tools = await client.listTools();
+
+            const navigated = await this._tryNavigateWithMcp(client, tools, url);
+            if (!navigated) {
+                return false;
+            }
+
+            await this._sleep(1500);
+            const filled = await this._tryFillInputWithMcp(client, tools, instruction);
+            if (!filled) {
+                return false;
+            }
+
+            return true;
+        } catch (error) {
+            console.error('MCP browser automation failed for server: ' + serverName, error);
+            return false;
         }
     }
 
-    // 导出MD文件 - 使用用户编辑后的内容
+    private async _tryNavigateWithMcp(client: StdioMcpClient, tools: McpToolInfo[], url: string): Promise<boolean> {
+        const navigationToolNames = tools
+            .map(tool => tool.name)
+            .filter(name => /(navigate|new.?page|open.?page|goto|open.?tab|new.?tab)/i.test(name));
+
+        const argumentGuesses: Array<Record<string, unknown>> = [
+            { url },
+            { uri: url },
+            { pageUrl: url },
+            { target: url },
+            { href: url }
+        ];
+
+        for (const toolName of navigationToolNames) {
+            for (const args of argumentGuesses) {
+                try {
+                    await client.callTool(toolName, args);
+                    return true;
+                } catch {
+                    // Try next argument shape.
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private async _tryFillInputWithMcp(client: StdioMcpClient, tools: McpToolInfo[], instruction: string): Promise<boolean> {
+        const fillToolNames = tools
+            .map(tool => tool.name)
+            .filter(name => /(fill|type|insert|input|paste|set.?value)/i.test(name));
+
+        const selectors = [
+            'textarea',
+            'textarea:not([disabled])',
+            '[contenteditable="true"]',
+            'div[contenteditable="true"]',
+            'input[type="text"]'
+        ];
+
+        for (const toolName of fillToolNames) {
+            for (const selector of selectors) {
+                const argumentGuesses: Array<Record<string, unknown>> = [
+                    { selector, text: instruction },
+                    { selector, value: instruction },
+                    { selector, input: instruction },
+                    { element: selector, text: instruction },
+                    { element: selector, value: instruction }
+                ];
+
+                for (const args of argumentGuesses) {
+                    try {
+                        await client.callTool(toolName, args);
+                        return true;
+                    } catch {
+                        // Try next argument shape.
+                    }
+                }
+            }
+        }
+
+        const evaluateToolNames = tools
+            .map(tool => tool.name)
+            .filter(name => /(evaluate|script|javascript|execute)/i.test(name));
+
+        const script = [
+            '(function(){',
+            'const text = ' + JSON.stringify(instruction) + ';',
+            'const candidates = Array.from(document.querySelectorAll(\'textarea, [contenteditable="true"], input[type="text"]\'));',
+            'const visible = candidates.filter((el) => {',
+            '  const rect = el.getBoundingClientRect();',
+            '  const style = window.getComputedStyle(el);',
+            '  return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";',
+            '});',
+            'const target = visible[0] || candidates[0];',
+            'if (!target) { return { ok: false, reason: "no-input" }; }',
+            'target.focus();',
+            'if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {',
+            '  target.value = text;',
+            '  target.dispatchEvent(new Event("input", { bubbles: true }));',
+            '  target.dispatchEvent(new Event("change", { bubbles: true }));',
+            '  return { ok: true, mode: "value" };',
+            '}',
+            'target.textContent = text;',
+            'target.dispatchEvent(new Event("input", { bubbles: true }));',
+            'return { ok: true, mode: "contenteditable" };',
+            '})()'
+        ].join('');
+
+        for (const toolName of evaluateToolNames) {
+            const argumentGuesses: Array<Record<string, unknown>> = [
+                { script },
+                { expression: script },
+                { code: script },
+                { function: script }
+            ];
+
+            for (const args of argumentGuesses) {
+                try {
+                    await client.callTool(toolName, args);
+                    return true;
+                } catch {
+                    // Try next argument shape.
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private async _sleep(ms: number): Promise<void> {
+        await new Promise(resolve => setTimeout(resolve, ms));
+    }
+    // Export markdown content to a chosen path
     private async _exportFiles(content?: string): Promise<void> {
         const files = Array.from(this._fileReferences.values());
         if (files.length === 0) {
-            vscode.window.showWarningMessage('没有可导出的文件引用');
+            vscode.window.showWarningMessage('No referenced files to export');
             return;
         }
 
-        // 优先使用用户编辑后的内容，如果没有则使用生成的内容
         const instruction = content || this._generateInstruction();
         if (!instruction || instruction.trim() === '') {
-            vscode.window.showWarningMessage('没有可导出的内容');
+            vscode.window.showWarningMessage('No content to export');
             return;
         }
 
-        // 选择保存位置
         const uri = await vscode.window.showSaveDialog({
             defaultUri: vscode.Uri.file('ai-instruction.md'),
             filters: {
-                'Markdown': ['md'],
-                'Text': ['txt'],
+                Markdown: ['md'],
+                Text: ['txt'],
                 'All Files': ['*']
             }
         });
@@ -659,171 +1232,228 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
         if (uri) {
             try {
                 await vscode.workspace.fs.writeFile(uri, Buffer.from(instruction, 'utf8'));
-                vscode.window.showInformationMessage(`已导出到: ${uri.fsPath}`);
+                vscode.window.showInformationMessage('Exported to: ' + uri.fsPath);
             } catch (error) {
-                vscode.window.showErrorMessage(`导出失败: ${error}`);
+                vscode.window.showErrorMessage('Export failed: ' + String(error));
             }
         }
     }
 
-    // 批量导出引用的文件到指定目录
-    private async _batchExportFiles(): Promise<void> {
+    private _getActiveWorkspaceFolder(): vscode.WorkspaceFolder | undefined {
+        const activeEditor = vscode.window.activeTextEditor;
+        if (activeEditor) {
+            const folder = vscode.workspace.getWorkspaceFolder(activeEditor.document.uri);
+            if (folder) {
+                return folder;
+            }
+        }
+
+        return vscode.workspace.workspaceFolders?.[0];
+    }
+
+    private _resolveExportRelativePath(filePath: string, rootPath: string, externalIndex: number): string {
+        const relativePath = path.relative(rootPath, filePath);
+        const isExternal = !relativePath || relativePath.startsWith('..') || path.isAbsolute(relativePath);
+
+        if (!isExternal) {
+            return relativePath.split(path.sep).join('/');
+        }
+
+        const safeBaseName = path.basename(filePath).replace(/[^a-zA-Z0-9._-]/g, '_');
+        return '__external__/ext-' + externalIndex + '-' + safeBaseName;
+    }
+
+    // Batch export referenced files to .ai/<timestamp>
+    private async _batchExportFiles(content?: string, exportMdEnabled?: boolean): Promise<void> {
         const files = Array.from(this._fileReferences.values());
         if (files.length === 0) {
-            vscode.window.showWarningMessage('没有可导出的文件引用');
+            vscode.window.showWarningMessage('No referenced files to export');
             return;
         }
 
-        // 选择目标文件夹
-        const folderUris = await vscode.window.showOpenDialog({
-            canSelectFiles: false,
-            canSelectFolders: true,
-            canSelectMany: false,
-            openLabel: '选择导出目录'
-        });
-
-        if (!folderUris || folderUris.length === 0) {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders || workspaceFolders.length === 0) {
+            vscode.window.showWarningMessage('Open a workspace first before running batch export');
             return;
         }
 
-        const targetDir = folderUris[0];
+        const activeFolder = this._getActiveWorkspaceFolder();
+        if (!activeFolder) {
+            vscode.window.showWarningMessage('Cannot determine active workspace root');
+            return;
+        }
+
+        const shouldExportMd = exportMdEnabled === undefined
+            ? this._batchExportSettings.exportMdEnabled
+            : exportMdEnabled === true;
+        await this._saveBatchExportSettings({ exportMdEnabled: shouldExportMd });
+
+        const groups = new Map<string, { rootPath: string; files: FileReference[] }>();
+        for (const file of files) {
+            const fileUri = vscode.Uri.file(file.path);
+            const owner = vscode.workspace.getWorkspaceFolder(fileUri) || activeFolder;
+            if (!owner) {
+                continue;
+            }
+
+            const rootPath = owner.uri.fsPath;
+            if (!groups.has(rootPath)) {
+                groups.set(rootPath, { rootPath, files: [] });
+            }
+            groups.get(rootPath)!.files.push(file);
+        }
+
+        if (groups.size === 0) {
+            vscode.window.showWarningMessage('No referenced files to export');
+            return;
+        }
+
+        const timestamp = Date.now().toString();
+        const instruction = (content && content.trim()) ? content : this._generateInstruction();
+        const sessions = this._loadLatestExportSessions();
+
         let successCount = 0;
         let failCount = 0;
+        let rootCount = 0;
 
-        for (const file of files) {
+        for (const group of groups.values()) {
+            const rootPath = group.rootPath;
+            const exportDir = path.join(rootPath, '.ai', timestamp);
+            const manifestEntries: ExportManifestEntry[] = [];
+            let externalIndex = 0;
+
+            await fs.promises.mkdir(exportDir, { recursive: true });
+
+            for (const file of group.files) {
+                try {
+                    const sourceUri = vscode.Uri.file(file.path);
+                    const contentBuffer = await vscode.workspace.fs.readFile(sourceUri);
+
+                    const ownerFolder = vscode.workspace.getWorkspaceFolder(sourceUri);
+                    const resolvedRelativePath = ownerFolder && ownerFolder.uri.fsPath === rootPath
+                        ? this._resolveExportRelativePath(file.path, rootPath, 0)
+                        : this._resolveExportRelativePath(file.path, rootPath, ++externalIndex);
+
+                    const targetPath = path.join(exportDir, ...resolvedRelativePath.split('/'));
+                    await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
+                    await fs.promises.writeFile(targetPath, contentBuffer);
+
+                    manifestEntries.push({
+                        exportedRelativePath: resolvedRelativePath,
+                        originalPath: file.path
+                    });
+                    successCount++;
+                } catch (error) {
+                    console.error('Export file failed: ' + file.path, error);
+                    failCount++;
+                }
+            }
+
+            let mdFile: string | undefined;
+            if (shouldExportMd && instruction && instruction.trim()) {
+                mdFile = 'instruction-' + timestamp + '.md';
+                await fs.promises.writeFile(path.join(exportDir, mdFile), instruction, 'utf8');
+            }
+
+            const manifest: ExportManifest = {
+                timestamp,
+                rootPath,
+                createdAt: new Date().toISOString(),
+                entries: manifestEntries,
+                mdFile
+            };
+
+            const manifestPath = path.join(exportDir, 'manifest.json');
+            await fs.promises.writeFile(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
+
+            sessions[rootPath] = {
+                timestamp,
+                rootPath,
+                exportDir,
+                manifestPath
+            };
+
+            rootCount++;
+        }
+
+        await this._saveLatestExportSessions(sessions);
+
+        if (failCount === 0) {
+            vscode.window.showInformationMessage('Batch export completed: ' + successCount + ' files, ' + rootCount + ' roots, timestamp ' + timestamp);
+        } else {
+            vscode.window.showWarningMessage('Batch export finished with errors: success ' + successCount + ', failed ' + failCount);
+        }
+    }
+
+    // Overwrite files using latest export session under current active workspace root
+    private async _overwriteFiles(): Promise<void> {
+        const activeFolder = this._getActiveWorkspaceFolder();
+        if (!activeFolder) {
+            vscode.window.showWarningMessage('Cannot determine active workspace root');
+            return;
+        }
+
+        const sessions = this._loadLatestExportSessions();
+        const session = sessions[activeFolder.uri.fsPath];
+        if (!session) {
+            vscode.window.showWarningMessage('No recent export session found for this workspace root. Run batch export first.');
+            return;
+        }
+
+        if (!fs.existsSync(session.manifestPath)) {
+            vscode.window.showWarningMessage('Export manifest not found. Run batch export again.');
+            return;
+        }
+
+        let manifest: ExportManifest;
+        try {
+            const manifestRaw = await fs.promises.readFile(session.manifestPath, 'utf8');
+            manifest = JSON.parse(manifestRaw) as ExportManifest;
+        } catch (error) {
+            vscode.window.showErrorMessage('Failed to read export manifest: ' + String(error));
+            return;
+        }
+
+        const confirm = await vscode.window.showWarningMessage(
+            'This will overwrite ' + manifest.entries.length + ' files from the latest export session. Continue?',
+            { modal: true },
+            'Confirm Overwrite',
+            'Cancel'
+        );
+
+        if (confirm !== 'Confirm Overwrite') {
+            return;
+        }
+
+        let successCount = 0;
+        let failCount = 0;
+        let skipCount = 0;
+
+        for (const entry of manifest.entries) {
+            const sourcePath = path.join(session.exportDir, ...entry.exportedRelativePath.split(/[\\/]/));
+            if (!fs.existsSync(sourcePath)) {
+                skipCount++;
+                continue;
+            }
+
             try {
-                const sourceUri = vscode.Uri.file(file.path);
-                const targetUri = vscode.Uri.joinPath(targetDir, file.name);
-
-                // 读取源文件内容
-                const content = await vscode.workspace.fs.readFile(sourceUri);
-                // 写入目标位置
-                await vscode.workspace.fs.writeFile(targetUri, content);
+                const contentBuffer = await fs.promises.readFile(sourcePath);
+                await fs.promises.mkdir(path.dirname(entry.originalPath), { recursive: true });
+                await fs.promises.writeFile(entry.originalPath, contentBuffer);
                 successCount++;
             } catch (error) {
-                console.error(`导出文件失败: ${file.path}`, error);
+                console.error('Overwrite file failed: ' + entry.originalPath, error);
                 failCount++;
             }
         }
 
         if (failCount === 0) {
-            vscode.window.showInformationMessage(`成功导出 ${successCount} 个文件到 ${targetDir.fsPath}`);
+            vscode.window.showInformationMessage('Overwrite completed: success ' + successCount + ', skipped ' + skipCount);
         } else {
-            vscode.window.showWarningMessage(`导出完成: ${successCount} 个成功, ${failCount} 个失败`);
+            vscode.window.showWarningMessage('Overwrite finished with errors: success ' + successCount + ', failed ' + failCount + ', skipped ' + skipCount);
         }
     }
 
-    // 覆盖文件 - 选取目录A，将A下的文件按原目录结构覆盖到对应路径
-    private async _overwriteFiles(): Promise<void> {
-        const files = Array.from(this._fileReferences.values());
-        if (files.length === 0) {
-            vscode.window.showWarningMessage('没有文件引用，请先添加文件');
-            return;
-        }
-
-        // 选择源目录（包含新文件的目录）
-        const sourceFolderUris = await vscode.window.showOpenDialog({
-            canSelectFiles: false,
-            canSelectFolders: true,
-            canSelectMany: false,
-            openLabel: '选择源文件目录'
-        });
-
-        if (!sourceFolderUris || sourceFolderUris.length === 0) {
-            return;
-        }
-
-        const sourceDir = sourceFolderUris[0].fsPath;
-
-        // 确认操作
-        const confirm = await vscode.window.showWarningMessage(
-            `即将用 "${path.basename(sourceDir)}" 目录下的文件覆盖原文件，此操作不可撤销。是否继续？`,
-            { modal: true },
-            '确认覆盖',
-            '取消'
-        );
-
-        if (confirm !== '确认覆盖') {
-            return;
-        }
-
-        // 读取源目录下的所有文件
-        const sourceFiles = await this._getAllFilesInDirectory(sourceDir);
-
-        if (sourceFiles.length === 0) {
-            vscode.window.showWarningMessage('源目录中没有文件');
-            return;
-        }
-
-        // 构建原文件的相对路径映射
-        const originalFilesMap = new Map<string, FileReference>(); // relativePath -> FileReference
-        const commonRoot = this._findCommonRoot(files.map(f => f.path));
-
-        for (const file of files) {
-            const relativePath = file.path.substring(commonRoot.length).replace(/^[/\\]/, '');
-            originalFilesMap.set(relativePath, file);
-        }
-
-        // 执行覆盖
-        let successCount = 0;
-        let failCount = 0;
-        let skipCount = 0;
-        const overwriteResults: string[] = [];
-
-        for (const sourceFilePath of sourceFiles) {
-            const sourceFileName = path.basename(sourceFilePath);
-            const sourceRelativePath = sourceFilePath.substring(sourceDir.length).replace(/^[/\\]/, '');
-
-            // 查找匹配的原文件
-            let matchedOriginal: FileReference | undefined;
-
-            // 优先按相对路径匹配
-            if (originalFilesMap.has(sourceRelativePath)) {
-                matchedOriginal = originalFilesMap.get(sourceRelativePath);
-            } else {
-                // 按文件名匹配
-                for (const [relPath, fileRef] of originalFilesMap) {
-                    if (path.basename(relPath) === sourceFileName) {
-                        matchedOriginal = fileRef;
-                        break;
-                    }
-                }
-            }
-
-            if (matchedOriginal) {
-                try {
-                    // 读取源文件内容
-                    const content = await fs.promises.readFile(sourceFilePath);
-                    // 写入原文件位置
-                    await fs.promises.writeFile(matchedOriginal.path, content);
-                    successCount++;
-                    overwriteResults.push(`✓ ${sourceRelativePath} → ${matchedOriginal.name}`);
-                } catch (error) {
-                    failCount++;
-                    overwriteResults.push(`✗ ${sourceRelativePath} (失败: ${error})`);
-                }
-            } else {
-                skipCount++;
-                overwriteResults.push(`⊘ ${sourceRelativePath} (未匹配到原文件)`);
-            }
-        }
-
-        // 显示结果
-        const message = `覆盖完成: ${successCount} 个成功, ${failCount} 个失败, ${skipCount} 个跳过`;
-        if (failCount === 0 && skipCount === 0) {
-            vscode.window.showInformationMessage(message);
-        } else if (failCount > 0) {
-            vscode.window.showErrorMessage(message);
-        } else {
-            vscode.window.showWarningMessage(message);
-        }
-
-        // 输出详细日志
-        console.log('覆盖文件详细结果:');
-        overwriteResults.forEach(r => console.log(r));
-    }
-
-    // 递归获取目录下所有文件
     private async _getAllFilesInDirectory(dirPath: string): Promise<string[]> {
         const files: string[] = [];
 
@@ -946,13 +1576,13 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
                 } else {
                     // 相对路径，基于工作区根目录
                     const workspaceFolders = vscode.workspace.workspaceFolders;
-                    
+
                     if (!workspaceFolders || workspaceFolders.length === 0) {
                         failCount++;
                         failedPaths.push(trimmedPath);
                         continue;
                     }
-                    
+
                     // 优先使用第一个工作区文件夹作为基准
                     const basePath = workspaceFolders[0].uri.fsPath;
                     filePath = path.join(basePath, trimmedPath);
@@ -1081,10 +1711,6 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
                 <span class="icon">🌐</span>
                 打开网页
             </button>
-            <button id="exportBtn" class="btn btn-secondary">
-                <span class="icon">💾</span>
-                导出MD
-            </button>
             <button id="batchExportBtn" class="btn btn-secondary">
                 <span class="icon">📁</span>
                 批量导出
@@ -1097,6 +1723,13 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
                 <span class="icon">🗑️</span>
                 清空
             </button>
+        </div>
+
+        <div class="export-md-toggle-row">
+            <label class="switch-label" for="exportMdToggle">
+                <input type="checkbox" id="exportMdToggle" />
+                <span>导出MD</span>
+            </label>
         </div>
 
         <div class="preview-section">
@@ -1112,11 +1745,17 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
 
         <div class="platform-section">
             <div class="platform-header">
-                <h3>打开 AI 页面</h3>
-                <button id="manageSitesBtn" class="btn-manage-sites">
-                    <span class="icon">⚙️</span>
-                    管理
-                </button>
+                <h3>打开网页</h3>
+                <div class="platform-header-actions">
+                    <button id="manageSitesBtn" class="btn-manage-sites">
+                        <span class="icon">⚙</span>
+                        管理
+                    </button>
+                    <button id="configMcpBtn" class="btn-manage-sites">
+                        <span class="icon">⚙</span>
+                        配置MCP
+                    </button>
+                </div>
             </div>
             <div class="platform-config">
                 <div class="form-group">
@@ -1165,8 +1804,265 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
         </div>
     </div>
 
+    <!-- MCP config modal -->
+    <div id="mcpModal" class="modal-overlay">
+        <div class="modal-container">
+            <div class="modal-header">
+                <h3>配置MCP</h3>
+                <div class="modal-header-actions">
+                    <button id="addMcpBtn" class="toolbar-btn">+</button>
+                    <button class="modal-close" title="Close">&times;</button>
+                </div>
+            </div>
+            <div class="modal-body">
+                <div id="mcpList" class="sites-list"></div>
+                <div id="addMcpForm" class="add-site-form" style="display:none;">
+                    <h4>添加 MCP 配置 (JSON)</h4>
+                    <div class="form-group">
+                        <label>JSON 内容</label>
+                        <textarea id="mcpJsonInput" class="form-control" rows="6" placeholder='{"mcpServers": {"server-name": {"command": "npx", "args": ["-y", "pkg@latest"]}}}'></textarea>
+                    </div>
+                    <div class="form-actions">
+                        <button id="cancelAddMcpBtn" class="btn-secondary">取消</button>
+                        <button id="confirmAddMcpBtn" class="btn-primary">确定</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script src="${scriptUri}"></script>
 </body>
 </html>`;
     }
 }
+
+
+class StdioMcpClient {
+    private process?: ChildProcessWithoutNullStreams;
+    private buffer: Buffer = Buffer.alloc(0);
+    private nextId = 1;
+    private pending = new Map<number, {
+        resolve: (value: unknown) => void;
+        reject: (reason?: unknown) => void;
+        timer: NodeJS.Timeout;
+    }>();
+
+    constructor(
+        private readonly command: string,
+        private readonly args: string[],
+        private readonly onExit?: () => void
+    ) { }
+
+    async start(): Promise<void> {
+        if (this.process) {
+            return;
+        }
+
+        await new Promise<void>((resolve, reject) => {
+            const child = spawn(this.command, this.args, {
+                stdio: 'pipe',
+                shell: process.platform === 'win32'
+            });
+
+            this.process = child;
+
+            child.stdout.on('data', (chunk: Buffer) => {
+                this.onStdoutData(chunk);
+            });
+
+            child.stderr.on('data', (chunk: Buffer) => {
+                console.error('[MCP stderr]', chunk.toString('utf8'));
+            });
+
+            child.once('spawn', () => resolve());
+            child.once('error', (error) => reject(error));
+            child.once('exit', (code, signal) => {
+                const reason = new Error('MCP process exited (code=' + code + ', signal=' + signal + ')');
+                this.process = undefined;
+                this.rejectAllPending(reason);
+                if (this.onExit) {
+                    this.onExit();
+                }
+            });
+        });
+    }
+
+    async initialize(): Promise<void> {
+        const baseParams = {
+            capabilities: {},
+            clientInfo: {
+                name: 'ai-code-uploader',
+                version: '2.0.0'
+            }
+        };
+
+        try {
+            await this.request('initialize', {
+                ...baseParams,
+                protocolVersion: '2024-11-05'
+            }, 180000);
+        } catch {
+            await this.request('initialize', {
+                ...baseParams,
+                protocolVersion: '2024-10-07'
+            }, 180000);
+        }
+
+        this.notify('notifications/initialized', {});
+    }
+
+    async listTools(): Promise<McpToolInfo[]> {
+        const result = await this.request('tools/list', {}, 60000);
+        if (!result || typeof result !== 'object') {
+            return [];
+        }
+
+        const toolsValue = (result as { tools?: unknown }).tools;
+        if (!Array.isArray(toolsValue)) {
+            return [];
+        }
+
+        const tools: McpToolInfo[] = [];
+        for (const item of toolsValue) {
+            if (!item || typeof item !== 'object') {
+                continue;
+            }
+            const nameValue = (item as { name?: unknown }).name;
+            if (typeof nameValue !== 'string' || !nameValue.trim()) {
+                continue;
+            }
+            tools.push({ name: nameValue });
+        }
+
+        return tools;
+    }
+
+    async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+        const result = await this.request('tools/call', {
+            name,
+            arguments: args
+        });
+
+        if (result && typeof result === 'object' && (result as { isError?: boolean }).isError) {
+            throw new Error('Tool call returned error for: ' + name);
+        }
+
+        return result;
+    }
+
+    dispose(): void {
+        if (this.process && !this.process.killed) {
+            this.process.kill();
+        }
+        this.rejectAllPending(new Error('MCP client disposed'));
+        this.process = undefined;
+        if (this.onExit) {
+            this.onExit();
+        }
+    }
+
+    private onStdoutData(chunk: Buffer): void {
+        this.buffer = Buffer.concat([this.buffer, chunk]);
+
+        while (true) {
+            let headerEndIndex = this.buffer.indexOf('\r\n\r\n');
+            let headerSeparatorLength = 4;
+            if (headerEndIndex < 0) {
+                headerEndIndex = this.buffer.indexOf('\n\n');
+                headerSeparatorLength = 2;
+            }
+            if (headerEndIndex < 0) {
+                return;
+            }
+
+            const headerText = this.buffer.slice(0, headerEndIndex).toString('utf8');
+            const match = headerText.match(/Content-Length:\s*(\d+)/i);
+            if (!match) {
+                this.buffer = Buffer.alloc(0);
+                this.rejectAllPending(new Error('Invalid MCP header without Content-Length'));
+                return;
+            }
+
+            const contentLength = Number(match[1]);
+            const bodyStartIndex = headerEndIndex + headerSeparatorLength;
+            const bodyEndIndex = bodyStartIndex + contentLength;
+            if (this.buffer.length < bodyEndIndex) {
+                return;
+            }
+
+            const bodyBuffer = this.buffer.slice(bodyStartIndex, bodyEndIndex);
+            this.buffer = this.buffer.slice(bodyEndIndex);
+
+            try {
+                const message = JSON.parse(bodyBuffer.toString('utf8')) as {
+                    id?: number;
+                    result?: unknown;
+                    error?: { message?: string };
+                };
+                if (typeof message.id === 'number') {
+                    const pending = this.pending.get(message.id);
+                    if (pending) {
+                        clearTimeout(pending.timer);
+                        this.pending.delete(message.id);
+                        if (message.error) {
+                            pending.reject(new Error(message.error.message || 'Unknown MCP error'));
+                        } else {
+                            pending.resolve(message.result);
+                        }
+                    }
+                }
+            } catch (error) {
+                console.error('Failed to parse MCP response message', error);
+            }
+        }
+    }
+
+    private request(method: string, params: unknown, timeoutMs = 15000): Promise<unknown> {
+        const id = this.nextId++;
+        return new Promise<unknown>((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this.pending.delete(id);
+                reject(new Error('MCP request timeout: ' + method));
+            }, timeoutMs);
+
+            this.pending.set(id, { resolve, reject, timer });
+            this.send({
+                jsonrpc: '2.0',
+                id,
+                method,
+                params
+            });
+        });
+    }
+
+    private notify(method: string, params: unknown): void {
+        this.send({
+            jsonrpc: '2.0',
+            method,
+            params
+        });
+    }
+
+    private send(message: Record<string, unknown>): void {
+        if (!this.process || !this.process.stdin.writable) {
+            throw new Error('MCP process is not writable');
+        }
+
+        const body = JSON.stringify(message);
+        const payload = 'Content-Length: ' + Buffer.byteLength(body, 'utf8') + '\r\n\r\n' + body;
+        this.process.stdin.write(payload, 'utf8');
+    }
+
+    private rejectAllPending(reason: Error): void {
+        for (const entry of this.pending.values()) {
+            clearTimeout(entry.timer);
+            entry.reject(reason);
+        }
+        this.pending.clear();
+    }
+}
+
+
+
+

@@ -7,8 +7,8 @@
     const previewEl = document.getElementById('preview');
     const copyBtn = document.getElementById('copyBtn');
     const browserBtn = document.getElementById('browserBtn');
-    const exportBtn = document.getElementById('exportBtn');
     const clearBtn = document.getElementById('clearBtn');
+    const exportMdToggle = document.getElementById('exportMdToggle');
     const batchExportBtn = document.getElementById('batchExportBtn');
     const selectFilesBtn = document.getElementById('selectFilesBtn');
     const platformSelect = document.getElementById('platformSelect');
@@ -17,6 +17,9 @@
     let currentFiles = [];
     let platformPresets = [];
     let currentPlatformConfig = { platform: 'Kimi', url: 'https://kimi.moonshot.cn' };
+    let batchExportSettings = { exportMdEnabled: false };
+    let mcpConfig = { mcpServers: {}, executor: 'chrome-devtools' };
+    let mcpRuntimeStatus = {};
     let dragCounter = 0;
     
     // 快捷用语数据
@@ -41,19 +44,19 @@
         });
 
         browserBtn.addEventListener('click', () => {
-            vscode.postMessage({ type: 'openBrowser' });
-        });
-
-        exportBtn.addEventListener('click', () => {
-            vscode.postMessage({ 
-                type: 'exportFiles',
-                content: previewEl.value 
+            vscode.postMessage({
+                type: 'openBrowser',
+                content: previewEl.value
             });
         });
 
         if (batchExportBtn) {
             batchExportBtn.addEventListener('click', () => {
-                vscode.postMessage({ type: 'batchExportFiles' });
+                vscode.postMessage({
+                    type: 'batchExportFiles',
+                    content: previewEl.value,
+                    exportMdEnabled: !!(exportMdToggle && exportMdToggle.checked)
+                });
             });
         }
         
@@ -125,18 +128,37 @@
             urlInput.addEventListener('change', handleUrlChange);
             urlInput.addEventListener('blur', handleUrlChange);
         }
+        if (exportMdToggle) {
+            exportMdToggle.addEventListener('change', () => {
+                const enabled = !!exportMdToggle.checked;
+                batchExportSettings.exportMdEnabled = enabled;
+                vscode.postMessage({
+                    type: 'updateBatchExportSettings',
+                    settings: { exportMdEnabled: enabled }
+                });
+            });
+        }
         
         // 初始化快捷用语弹窗
         initQuickPhrasesModal();
         
         // 初始化站点管理弹窗
         initSitesModal();
+
+        // Initialize MCP config modal
+        initMcpModal();
         
         // 请求快捷用语数据
         vscode.postMessage({ type: 'getQuickPhrases' });
         
         // 请求平台预设数据
         vscode.postMessage({ type: 'getPlatformPresets' });
+
+        // Request batch export settings
+        vscode.postMessage({ type: 'getBatchExportSettings' });
+
+        // Request MCP config
+        vscode.postMessage({ type: 'getMcpConfig' });
     }
 
     // 处理平台选择变化
@@ -278,7 +300,6 @@
         const hasFiles = files.length > 0;
         copyBtn.disabled = !hasFiles;
         browserBtn.disabled = !hasFiles;
-        exportBtn.disabled = !hasFiles;
         if (batchExportBtn) {
             batchExportBtn.disabled = !hasFiles;
         }
@@ -472,7 +493,7 @@
                 break;
             case 'updatePlatformConfig':
                 updatePlatformConfig(message.config, message.presets);
-                // 刷新站点管理列表（如果弹窗打开）
+                // Refresh site list if site modal is currently open
                 const sitesModal = document.getElementById('sitesModal');
                 if (sitesModal && sitesModal.classList.contains('active')) {
                     renderSitesList();
@@ -481,13 +502,33 @@
             case 'updateQuickPhrases':
                 quickPhrases = message.phrases || [];
                 categories = message.categories || [];
-                // 如果当前分类不存在了（被删除），切换到默认分类
+                // Switch to first category if current one was removed
                 const categoryExists = categories.some(c => c.id === currentCategory);
                 if (!categoryExists && categories.length > 0) {
                     currentCategory = categories[0].id;
                 }
                 renderCategories();
                 renderQuickPhrases();
+                break;
+            case 'updateBatchExportSettings':
+                batchExportSettings = message.settings || { exportMdEnabled: false };
+                if (exportMdToggle) {
+                    exportMdToggle.checked = !!batchExportSettings.exportMdEnabled;
+                }
+                break;
+            case 'updateMcpConfig':
+                mcpConfig = message.config || { mcpServers: {}, executor: 'chrome-devtools' };
+                const mcpModal = document.getElementById('mcpModal');
+                if (mcpModal && mcpModal.classList.contains('active')) {
+                    renderMcpList();
+                }
+                break;
+            case 'updateMcpRuntimeStatus':
+                mcpRuntimeStatus = message.runtime || {};
+                const runtimeModal = document.getElementById('mcpModal');
+                if (runtimeModal && runtimeModal.classList.contains('active')) {
+                    renderMcpList();
+                }
                 break;
         }
     });
@@ -1119,5 +1160,176 @@
     }
 
     // 启动
+
+    function initMcpModal() {
+        const configMcpBtn = document.getElementById('configMcpBtn');
+        const modal = document.getElementById('mcpModal');
+        if (!configMcpBtn || !modal) {
+            return;
+        }
+
+        const closeBtn = modal.querySelector('.modal-close');
+        const addMcpBtn = document.getElementById('addMcpBtn');
+        const cancelAddMcpBtn = document.getElementById('cancelAddMcpBtn');
+        const confirmAddMcpBtn = document.getElementById('confirmAddMcpBtn');
+
+        configMcpBtn.addEventListener('click', () => {
+            modal.classList.add('active');
+            hideAddMcpForm();
+            renderMcpList();
+        });
+
+        if (closeBtn) {
+            closeBtn.addEventListener('click', () => {
+                modal.classList.remove('active');
+                hideAddMcpForm();
+            });
+        }
+
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) {
+                modal.classList.remove('active');
+                hideAddMcpForm();
+            }
+        });
+
+        if (addMcpBtn) {
+            addMcpBtn.addEventListener('click', showAddMcpForm);
+        }
+        if (cancelAddMcpBtn) {
+            cancelAddMcpBtn.addEventListener('click', hideAddMcpForm);
+        }
+        if (confirmAddMcpBtn) {
+            confirmAddMcpBtn.addEventListener('click', confirmAddMcpJson);
+        }
+    }
+
+    function renderMcpList() {
+        const mcpListEl = document.getElementById('mcpList');
+        if (!mcpListEl) {
+            return;
+        }
+
+        const entries = Object.entries((mcpConfig && mcpConfig.mcpServers) || {});
+        if (entries.length === 0) {
+            mcpListEl.innerHTML = '<div class="empty-sites"><p>No MCP servers configured</p></div>';
+            return;
+        }
+
+        const statusMap = {
+            ready: '就绪',
+            starting: '启动中',
+            error: '异常',
+            stopped: '未启动'
+        };
+
+        mcpListEl.innerHTML = entries.map(([name, server]) => {
+            const isExecutor = mcpConfig.executor === name;
+            const isLocked = !!server.locked;
+            const enabled = isLocked ? true : !!server.enabled;
+            const argsText = Array.isArray(server.args) ? server.args.join(' ') : '';
+            const runtime = mcpRuntimeStatus[name] || { status: 'stopped' };
+            const statusLabel = statusMap[runtime.status] || runtime.status;
+            const errorText = runtime.lastError ? '<span class="mcp-error">(' + escapeHtml(runtime.lastError) + ')</span>' : '';
+            const startLabel = runtime.status === 'ready' ? '已就绪' : runtime.status === 'starting' ? '启动中' : '启动';
+            const startDisabled = runtime.status === 'ready' || runtime.status === 'starting' ? ' disabled' : '';
+
+            return '<div class="site-item" data-mcp-name="' + encodeURIComponent(name) + '">' +
+                '<div class="site-info">' +
+                '<div class="site-name">' + escapeHtml(name) + (isExecutor ? ' (executor)' : '') + '</div>' +
+                '<div class="site-url">' + escapeHtml((server.command || '') + (argsText ? ' ' + argsText : '')) + '</div>' +
+                '</div>' +
+                '<div class="mcp-item-actions">' +
+                '<div class="mcp-status-row">' +
+                '<span class="mcp-status-label">' + statusLabel + '</span>' +
+                errorText +
+                '<button class="mcp-start-btn" data-mcp-name="' + encodeURIComponent(name) + '"' + startDisabled + '>' + startLabel + '</button>' +
+                '</div>' +
+                '<label class="mcp-inline-label">' +
+                '<input type="checkbox" class="mcp-enabled-toggle" ' + (enabled ? 'checked' : '') + ' ' + (isLocked ? 'disabled' : '') + '>' +
+                '<span>' + (isLocked ? 'Always On' : 'Enabled') + '</span>' +
+                '</label>' +
+                '<label class="mcp-inline-label">' +
+                '<input type="radio" name="mcpExecutor" class="mcp-executor-radio" ' + (isExecutor ? 'checked' : '') + '>' +
+                '<span>Executor</span>' +
+                '</label>' +
+                '</div>' +
+                '</div>';
+        }).join('');
+
+        mcpListEl.querySelectorAll('.mcp-enabled-toggle').forEach((input) => {
+            input.addEventListener('change', (e) => {
+                const item = e.currentTarget.closest('.site-item');
+                if (!item) return;
+                const name = decodeURIComponent(item.dataset.mcpName);
+                vscode.postMessage({
+                    type: 'updateMcpServerEnabled',
+                    name,
+                    enabled: !!e.currentTarget.checked
+                });
+            });
+        });
+
+        mcpListEl.querySelectorAll('.mcp-executor-radio').forEach((input) => {
+            input.addEventListener('change', (e) => {
+                if (!e.currentTarget.checked) return;
+                const item = e.currentTarget.closest('.site-item');
+                if (!item) return;
+                const name = decodeURIComponent(item.dataset.mcpName);
+                vscode.postMessage({
+                    type: 'setMcpExecutor',
+                    name
+                });
+            });
+        });
+
+        mcpListEl.querySelectorAll('.mcp-start-btn').forEach((button) => {
+            button.addEventListener('click', () => {
+                const name = decodeURIComponent(button.dataset.mcpName);
+                vscode.postMessage({
+                    type: 'startMcpServer',
+                    name
+                });
+            });
+        });
+    }
+    function showAddMcpForm() {
+        const form = document.getElementById('addMcpForm');
+        const input = document.getElementById('mcpJsonInput');
+        if (!form || !input) {
+            return;
+        }
+
+        form.style.display = 'block';
+        input.value = '';
+        input.focus();
+    }
+
+    function hideAddMcpForm() {
+        const form = document.getElementById('addMcpForm');
+        if (!form) {
+            return;
+        }
+        form.style.display = 'none';
+    }
+
+    function confirmAddMcpJson() {
+        const input = document.getElementById('mcpJsonInput');
+        if (!input) {
+            return;
+        }
+
+        const rawJson = input.value.trim();
+        if (!rawJson) {
+            return;
+        }
+
+        vscode.postMessage({
+            type: 'addMcpServersByJson',
+            json: rawJson
+        });
+        hideAddMcpForm();
+    }
+
     init();
 })();

@@ -1,6 +1,9 @@
 # AI Code Uploader
 
 智能文件引用与 AI 对话助手 - VS Code 插件
+当大家都在用cli的时候，这里有一个古朴的对话编程解决方案：适合订阅了对话版而非api版本的省钱玩家。
+
+<img width="433" height="1100" alt="image" src="https://github.com/user-attachments/assets/ffcea5ad-1d7e-4020-b3c1-6febea15dae7" />
 
 ## 功能特性
 

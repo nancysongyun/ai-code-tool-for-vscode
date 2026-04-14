@@ -96,7 +96,7 @@ const MCP_CONFIG_KEY = 'aiUploaderMcpConfig';
 const BUILTIN_CHROME_MCP_NAME = 'chrome-devtools';
 const BUILTIN_CHROME_MCP_CONFIG: McpServerConfig = {
     command: 'npx',
-    args: ['-y', 'chrome-devtools-mcp@latest', '--autoConnect'],
+    args: ['-y', '--prefer-offline', 'chrome-devtools-mcp@0.21.0', '--isolated'],
     enabled: true,
     locked: true
 };
@@ -260,7 +260,10 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
             if (!server || typeof server.command !== 'string' || !server.command.trim()) {
                 continue;
             }
-            const args = Array.isArray(server.args) ? server.args.filter(arg => typeof arg === 'string') : [];
+            let args = Array.isArray(server.args) ? server.args.filter(arg => typeof arg === 'string') : [];
+            if (server.command.trim().toLowerCase() === 'npx' && !args.some(arg => arg === '-y' || arg === '--yes')) {
+                args = ['-y', ...args];
+            }
             normalizedServers[name] = {
                 command: server.command,
                 args,
@@ -436,14 +439,18 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
             return;
         }
 
-        if (!parsed || typeof parsed !== 'object' || !('mcpServers' in parsed)) {
-            vscode.window.showErrorMessage('Invalid JSON format: missing mcpServers object');
+        if (!parsed || typeof parsed !== 'object') {
+            vscode.window.showErrorMessage('Invalid JSON format: expected an object');
             return;
         }
 
-        const candidateServers = (parsed as { mcpServers?: Record<string, Partial<McpServerConfig>> }).mcpServers;
+        const parsedConfig = parsed as {
+            mcpServers?: Record<string, Partial<McpServerConfig>>;
+            servers?: Record<string, Partial<McpServerConfig>>;
+        };
+        const candidateServers = parsedConfig.mcpServers || parsedConfig.servers;
         if (!candidateServers || typeof candidateServers !== 'object') {
-            vscode.window.showErrorMessage('Invalid JSON format: mcpServers must be an object');
+            vscode.window.showErrorMessage('Invalid JSON format: missing mcpServers or servers object');
             return;
         }
 
@@ -461,7 +468,10 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
                 continue;
             }
 
-            const args = Array.isArray(server.args) ? server.args.filter(arg => typeof arg === 'string') : [];
+            let args = Array.isArray(server.args) ? server.args.filter(arg => typeof arg === 'string') : [];
+            if (server.command.trim().toLowerCase() === 'npx' && !args.some(arg => arg === '-y' || arg === '--yes')) {
+                args = ['-y', ...args];
+            }
             nextConfig.mcpServers[name] = {
                 command: server.command,
                 args,
@@ -1026,7 +1036,7 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
 
         const mcpSuccess = await this._openBrowserWithMcp(url, instruction);
         if (mcpSuccess) {
-            vscode.window.showInformationMessage('Opened page and filled instruction via MCP');
+            vscode.window.showInformationMessage('Opened page, filled instruction, and submitted via MCP');
             return;
         }
 
@@ -1086,6 +1096,12 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
                 return false;
             }
 
+            await this._sleep(300);
+            const submitted = await this._trySubmitInputWithMcp(client, tools, instruction);
+            if (!submitted) {
+                return false;
+            }
+
             return true;
         } catch (error) {
             console.error('MCP browser automation failed for server: ' + serverName, error);
@@ -1094,9 +1110,11 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
     }
 
     private async _tryNavigateWithMcp(client: StdioMcpClient, tools: McpToolInfo[], url: string): Promise<boolean> {
-        const navigationToolNames = tools
-            .map(tool => tool.name)
-            .filter(name => /(navigate|new.?page|open.?page|goto|open.?tab|new.?tab)/i.test(name));
+        const toolNames = tools.map(tool => tool.name);
+        const newPageToolNames = toolNames
+            .filter(name => /(new.?page|open.?page|new.?tab|open.?tab)/i.test(name));
+        const navigationToolNames = toolNames
+            .filter(name => /(navigate|goto)/i.test(name));
 
         const argumentGuesses: Array<Record<string, unknown>> = [
             { url },
@@ -1106,7 +1124,26 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
             { href: url }
         ];
 
-        for (const toolName of navigationToolNames) {
+        if (await this._tryCallMcpTools(client, newPageToolNames, argumentGuesses)) {
+            return true;
+        }
+
+        if (newPageToolNames.length > 0 && await this._tryCallMcpTools(client, newPageToolNames, [{}])) {
+            await this._sleep(500);
+            if (await this._tryCallMcpTools(client, navigationToolNames, argumentGuesses)) {
+                return true;
+            }
+        }
+
+        return this._tryCallMcpTools(client, navigationToolNames, argumentGuesses);
+    }
+
+    private async _tryCallMcpTools(
+        client: StdioMcpClient,
+        toolNames: string[],
+        argumentGuesses: Array<Record<string, unknown>>
+    ): Promise<boolean> {
+        for (const toolName of toolNames) {
             for (const args of argumentGuesses) {
                 try {
                     await client.callTool(toolName, args);
@@ -1121,6 +1158,38 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
     }
 
     private async _tryFillInputWithMcp(client: StdioMcpClient, tools: McpToolInfo[], instruction: string): Promise<boolean> {
+        const script = [
+            '(function(){',
+            'const text = ' + JSON.stringify(instruction) + ';',
+            'const candidates = Array.from(document.querySelectorAll(\'textarea, [contenteditable="true"], input[type="text"]\'));',
+            'const visible = candidates.filter((el) => {',
+            '  const rect = el.getBoundingClientRect();',
+            '  const style = window.getComputedStyle(el);',
+            '  return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";',
+            '});',
+            'const target = visible[0] || candidates[0];',
+            'if (!target) { throw new Error("no-input"); }',
+            'const getValue = (el) => el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? el.value : (el.textContent || "");',
+            'target.focus();',
+            'if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {',
+            '  const proto = target instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;',
+            '  const descriptor = Object.getOwnPropertyDescriptor(proto, "value");',
+            '  if (descriptor && descriptor.set) { descriptor.set.call(target, text); } else { target.value = text; }',
+            '  target.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));',
+            '  target.dispatchEvent(new Event("change", { bubbles: true }));',
+            '} else {',
+            '  target.textContent = text;',
+            '  target.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));',
+            '}',
+            'if (getValue(target) !== text) { throw new Error("input-not-complete"); }',
+            'return { ok: true };',
+            '})()'
+        ].join('');
+
+        if (await this._tryEvaluateWithMcp(client, tools, script)) {
+            return true;
+        }
+
         const fillToolNames = tools
             .map(tool => tool.name)
             .filter(name => /(fill|type|insert|input|paste|set.?value)/i.test(name));
@@ -1146,7 +1215,9 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
                 for (const args of argumentGuesses) {
                     try {
                         await client.callTool(toolName, args);
-                        return true;
+                        if (await this._waitForMcpInputToMatch(client, tools, instruction)) {
+                            return true;
+                        }
                     } catch {
                         // Try next argument shape.
                     }
@@ -1154,33 +1225,109 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
             }
         }
 
-        const evaluateToolNames = tools
-            .map(tool => tool.name)
-            .filter(name => /(evaluate|script|javascript|execute)/i.test(name));
+        return false;
+    }
 
+    private async _waitForMcpInputToMatch(client: StdioMcpClient, tools: McpToolInfo[], instruction: string): Promise<boolean> {
         const script = [
             '(function(){',
             'const text = ' + JSON.stringify(instruction) + ';',
             'const candidates = Array.from(document.querySelectorAll(\'textarea, [contenteditable="true"], input[type="text"]\'));',
-            'const visible = candidates.filter((el) => {',
-            '  const rect = el.getBoundingClientRect();',
-            '  const style = window.getComputedStyle(el);',
-            '  return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";',
+            'const matched = candidates.some((el) => {',
+            '  const value = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? el.value : (el.textContent || "");',
+            '  return value === text;',
             '});',
-            'const target = visible[0] || candidates[0];',
-            'if (!target) { return { ok: false, reason: "no-input" }; }',
-            'target.focus();',
-            'if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {',
-            '  target.value = text;',
-            '  target.dispatchEvent(new Event("input", { bubbles: true }));',
-            '  target.dispatchEvent(new Event("change", { bubbles: true }));',
-            '  return { ok: true, mode: "value" };',
-            '}',
-            'target.textContent = text;',
-            'target.dispatchEvent(new Event("input", { bubbles: true }));',
-            'return { ok: true, mode: "contenteditable" };',
+            'if (!matched) { throw new Error("input-not-complete"); }',
+            'return { ok: true };',
             '})()'
         ].join('');
+
+        for (let attempt = 0; attempt < 10; attempt++) {
+            if (await this._tryEvaluateWithMcp(client, tools, script)) {
+                return true;
+            }
+            await this._sleep(150);
+        }
+
+        return false;
+    }
+
+    private async _trySubmitInputWithMcp(client: StdioMcpClient, tools: McpToolInfo[], instruction: string): Promise<boolean> {
+        const clickScript = [
+            '(function(){',
+            'const text = ' + JSON.stringify(instruction) + ';',
+            'const candidates = Array.from(document.querySelectorAll(\'textarea, [contenteditable="true"], input[type="text"]\'));',
+            'const target = candidates.find((el) => {',
+            '  const value = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? el.value : (el.textContent || "");',
+            '  return value === text;',
+            '});',
+            'if (!target) { throw new Error("input-not-complete"); }',
+            'target.focus();',
+            'const buttons = Array.from(document.querySelectorAll(\'button, [role="button"], input[type="submit"]\'));',
+            'const sendButton = buttons.find((el) => {',
+            '  if (el instanceof HTMLButtonElement && el.disabled) { return false; }',
+            '  if (el instanceof HTMLInputElement && el.disabled) { return false; }',
+            '  if (el.getAttribute("aria-disabled") === "true") { return false; }',
+            '  const label = ((el.getAttribute("aria-label") || "") + " " + (el.getAttribute("title") || "") + " " + (el.textContent || "") + " " + ((el instanceof HTMLInputElement && el.value) || "")).trim();',
+            '  return /(send|submit|发送|提交|确认|發送|送出)/i.test(label);',
+            '});',
+            'if (!(sendButton instanceof HTMLElement)) { throw new Error("no-send-button"); }',
+            'sendButton.click();',
+            'return { ok: true, mode: "button" };',
+            '})()'
+        ].join('');
+
+        if (await this._tryEvaluateWithMcp(client, tools, clickScript)) {
+            return true;
+        }
+
+        if (!await this._waitForMcpInputToMatch(client, tools, instruction)) {
+            return false;
+        }
+
+        if (await this._tryPressEnterWithMcp(client, tools)) {
+            return true;
+        }
+
+        const enterScript = [
+            '(function(){',
+            'const text = ' + JSON.stringify(instruction) + ';',
+            'const candidates = Array.from(document.querySelectorAll(\'textarea, [contenteditable="true"], input[type="text"]\'));',
+            'const target = candidates.find((el) => {',
+            '  const value = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? el.value : (el.textContent || "");',
+            '  return value === text;',
+            '});',
+            'if (!target) { throw new Error("input-not-complete"); }',
+            'target.focus();',
+            'target.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }));',
+            'target.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }));',
+            'return { ok: true, mode: "synthetic-enter" };',
+            '})()'
+        ].join('');
+
+        return this._tryEvaluateWithMcp(client, tools, enterScript);
+    }
+
+    private async _tryPressEnterWithMcp(client: StdioMcpClient, tools: McpToolInfo[]): Promise<boolean> {
+        const keyToolNames = tools
+            .map(tool => tool.name)
+            .filter(name => /(press|keyboard|key)/i.test(name));
+
+        const argumentGuesses: Array<Record<string, unknown>> = [
+            { key: 'Enter' },
+            { keys: ['Enter'] },
+            { text: 'Enter' },
+            { value: 'Enter' },
+            { key: 'Enter', code: 'Enter' }
+        ];
+
+        return this._tryCallMcpTools(client, keyToolNames, argumentGuesses);
+    }
+
+    private async _tryEvaluateWithMcp(client: StdioMcpClient, tools: McpToolInfo[], script: string): Promise<boolean> {
+        const evaluateToolNames = tools
+            .map(tool => tool.name)
+            .filter(name => /(evaluate|script|javascript|execute)/i.test(name));
 
         for (const toolName of evaluateToolNames) {
             const argumentGuesses: Array<Record<string, unknown>> = [
@@ -1202,7 +1349,6 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
 
         return false;
     }
-
     private async _sleep(ms: number): Promise<void> {
         await new Promise(resolve => setTimeout(resolve, ms));
     }
@@ -1251,19 +1397,39 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
         return vscode.workspace.workspaceFolders?.[0];
     }
 
-    private _resolveExportRelativePath(filePath: string, rootPath: string, externalIndex: number): string {
-        const relativePath = path.relative(rootPath, filePath);
-        const isExternal = !relativePath || relativePath.startsWith('..') || path.isAbsolute(relativePath);
+    private _resolveFlatExportFileName(filePath: string, usedFileNames: Set<string>): string {
+        const fallbackName = 'exported-file';
+        const rawBaseName = path.basename(filePath) || fallbackName;
+        const safeBaseName = rawBaseName.replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').trim() || fallbackName;
 
-        if (!isExternal) {
-            return relativePath.split(path.sep).join('/');
+        const reserveName = (name: string): string | undefined => {
+            const key = name.toLowerCase();
+            if (usedFileNames.has(key)) {
+                return undefined;
+            }
+            usedFileNames.add(key);
+            return name;
+        };
+
+        const reserved = reserveName(safeBaseName);
+        if (reserved) {
+            return reserved;
         }
 
-        const safeBaseName = path.basename(filePath).replace(/[^a-zA-Z0-9._-]/g, '_');
-        return '__external__/ext-' + externalIndex + '-' + safeBaseName;
+        const ext = path.extname(safeBaseName);
+        const stem = ext ? safeBaseName.slice(0, -ext.length) : safeBaseName;
+        let counter = 2;
+        while (true) {
+            const candidate = stem + '-' + counter + ext;
+            const availableName = reserveName(candidate);
+            if (availableName) {
+                return availableName;
+            }
+            counter++;
+        }
     }
 
-    // Batch export referenced files to .ai/<timestamp>
+    // Batch export referenced files to .ai/<timestamp> with code files in one folder.
     private async _batchExportFiles(content?: string, exportMdEnabled?: boolean): Promise<void> {
         const files = Array.from(this._fileReferences.values());
         if (files.length === 0) {
@@ -1320,7 +1486,7 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
             const rootPath = group.rootPath;
             const exportDir = path.join(rootPath, '.ai', timestamp);
             const manifestEntries: ExportManifestEntry[] = [];
-            let externalIndex = 0;
+            const usedFileNames = new Set<string>();
 
             await fs.promises.mkdir(exportDir, { recursive: true });
 
@@ -1329,13 +1495,9 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
                     const sourceUri = vscode.Uri.file(file.path);
                     const contentBuffer = await vscode.workspace.fs.readFile(sourceUri);
 
-                    const ownerFolder = vscode.workspace.getWorkspaceFolder(sourceUri);
-                    const resolvedRelativePath = ownerFolder && ownerFolder.uri.fsPath === rootPath
-                        ? this._resolveExportRelativePath(file.path, rootPath, 0)
-                        : this._resolveExportRelativePath(file.path, rootPath, ++externalIndex);
+                    const resolvedRelativePath = this._resolveFlatExportFileName(file.path, usedFileNames);
 
-                    const targetPath = path.join(exportDir, ...resolvedRelativePath.split('/'));
-                    await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
+                    const targetPath = path.join(exportDir, resolvedRelativePath);
                     await fs.promises.writeFile(targetPath, contentBuffer);
 
                     manifestEntries.push({
@@ -1820,7 +1982,7 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
                     <h4>添加 MCP 配置 (JSON)</h4>
                     <div class="form-group">
                         <label>JSON 内容</label>
-                        <textarea id="mcpJsonInput" class="form-control" rows="6" placeholder='{"mcpServers": {"server-name": {"command": "npx", "args": ["-y", "pkg@latest"]}}}'></textarea>
+                        <textarea id="mcpJsonInput" class="form-control" rows="6" placeholder='{"servers": {"server-name": {"command": "npx", "args": ["-y", "pkg@latest"], "type": "stdio"}}}'></textarea>
                     </div>
                     <div class="form-actions">
                         <button id="cancelAddMcpBtn" class="btn-secondary">取消</button>
@@ -1965,56 +2127,77 @@ class StdioMcpClient {
     private onStdoutData(chunk: Buffer): void {
         this.buffer = Buffer.concat([this.buffer, chunk]);
 
-        while (true) {
+        while (this.buffer.length > 0) {
             let headerEndIndex = this.buffer.indexOf('\r\n\r\n');
             let headerSeparatorLength = 4;
             if (headerEndIndex < 0) {
                 headerEndIndex = this.buffer.indexOf('\n\n');
                 headerSeparatorLength = 2;
             }
-            if (headerEndIndex < 0) {
+
+            const newlineIndex = this.buffer.indexOf('\n');
+            const startsWithContentLength = /^Content-Length:/i.test(
+                this.buffer.slice(0, Math.min(this.buffer.length, 64)).toString('utf8')
+            );
+
+            if (startsWithContentLength) {
+                if (headerEndIndex < 0) {
+                    return;
+                }
+                const headerText = this.buffer.slice(0, headerEndIndex).toString('utf8');
+                const match = headerText.match(/Content-Length:\s*(\d+)/i);
+                if (!match) {
+                    this.buffer = Buffer.alloc(0);
+                    this.rejectAllPending(new Error('Invalid MCP header without Content-Length'));
+                    return;
+                }
+
+                const contentLength = Number(match[1]);
+                const bodyStartIndex = headerEndIndex + headerSeparatorLength;
+                const bodyEndIndex = bodyStartIndex + contentLength;
+                if (this.buffer.length < bodyEndIndex) {
+                    return;
+                }
+
+                const bodyBuffer = this.buffer.slice(bodyStartIndex, bodyEndIndex);
+                this.buffer = this.buffer.slice(bodyEndIndex);
+                this.handleMessageBody(bodyBuffer.toString('utf8'));
+                continue;
+            }
+
+            if (newlineIndex < 0) {
                 return;
             }
 
-            const headerText = this.buffer.slice(0, headerEndIndex).toString('utf8');
-            const match = headerText.match(/Content-Length:\s*(\d+)/i);
-            if (!match) {
-                this.buffer = Buffer.alloc(0);
-                this.rejectAllPending(new Error('Invalid MCP header without Content-Length'));
-                return;
+            const line = this.buffer.slice(0, newlineIndex).toString('utf8').replace(/\r$/, '');
+            this.buffer = this.buffer.slice(newlineIndex + 1);
+            if (line.trim()) {
+                this.handleMessageBody(line);
             }
+        }
+    }
 
-            const contentLength = Number(match[1]);
-            const bodyStartIndex = headerEndIndex + headerSeparatorLength;
-            const bodyEndIndex = bodyStartIndex + contentLength;
-            if (this.buffer.length < bodyEndIndex) {
-                return;
-            }
-
-            const bodyBuffer = this.buffer.slice(bodyStartIndex, bodyEndIndex);
-            this.buffer = this.buffer.slice(bodyEndIndex);
-
-            try {
-                const message = JSON.parse(bodyBuffer.toString('utf8')) as {
-                    id?: number;
-                    result?: unknown;
-                    error?: { message?: string };
-                };
-                if (typeof message.id === 'number') {
-                    const pending = this.pending.get(message.id);
-                    if (pending) {
-                        clearTimeout(pending.timer);
-                        this.pending.delete(message.id);
-                        if (message.error) {
-                            pending.reject(new Error(message.error.message || 'Unknown MCP error'));
-                        } else {
-                            pending.resolve(message.result);
-                        }
+    private handleMessageBody(body: string): void {
+        try {
+            const message = JSON.parse(body) as {
+                id?: number;
+                result?: unknown;
+                error?: { message?: string };
+            };
+            if (typeof message.id === 'number') {
+                const pending = this.pending.get(message.id);
+                if (pending) {
+                    clearTimeout(pending.timer);
+                    this.pending.delete(message.id);
+                    if (message.error) {
+                        pending.reject(new Error(message.error.message || 'Unknown MCP error'));
+                    } else {
+                        pending.resolve(message.result);
                     }
                 }
-            } catch (error) {
-                console.error('Failed to parse MCP response message', error);
             }
+        } catch (error) {
+            console.error('Failed to parse MCP response message', error);
         }
     }
 
@@ -2049,9 +2232,7 @@ class StdioMcpClient {
             throw new Error('MCP process is not writable');
         }
 
-        const body = JSON.stringify(message);
-        const payload = 'Content-Length: ' + Buffer.byteLength(body, 'utf8') + '\r\n\r\n' + body;
-        this.process.stdin.write(payload, 'utf8');
+        this.process.stdin.write(JSON.stringify(message) + '\n', 'utf8');
     }
 
     private rejectAllPending(reason: Error): void {

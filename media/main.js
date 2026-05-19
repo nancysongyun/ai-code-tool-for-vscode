@@ -11,6 +11,7 @@
     const exportMdToggle = document.getElementById('exportMdToggle');
     const batchExportBtn = document.getElementById('batchExportBtn');
     const selectFilesBtn = document.getElementById('selectFilesBtn');
+    const batchImportBtn = document.getElementById('batchImportBtn');
     const platformSelect = document.getElementById('platformSelect');
     const urlInput = document.getElementById('urlInput');
 
@@ -21,6 +22,7 @@
     let mcpConfig = { mcpServers: {}, executor: 'chrome-devtools' };
     let mcpRuntimeStatus = {};
     let dragCounter = 0;
+    let batchImportInputEl = null;
     
     // 快捷用语数据
     let quickPhrases = [];
@@ -144,6 +146,8 @@
         
         // 初始化站点管理弹窗
         initSitesModal();
+
+        initBatchImportModal();
 
         // Initialize MCP config modal
         initMcpModal();
@@ -528,6 +532,12 @@
                 const runtimeModal = document.getElementById('mcpModal');
                 if (runtimeModal && runtimeModal.classList.contains('active')) {
                     renderMcpList();
+                }
+                break;
+            case 'clipboardText':
+                if (batchImportInputEl) {
+                    batchImportInputEl.value = message.text || '';
+                    batchImportInputEl.focus();
                 }
                 break;
         }
@@ -1202,6 +1212,53 @@
         if (confirmAddMcpBtn) {
             confirmAddMcpBtn.addEventListener('click', confirmAddMcpJson);
         }
+    }
+
+    function initBatchImportModal() {
+        const modal = document.getElementById('batchImportModal');
+        const input = document.getElementById('batchImportInput');
+        const pasteBtn = document.getElementById('batchImportPasteBtn');
+        const cancelBtn = document.getElementById('batchImportCancelBtn');
+        const confirmBtn = document.getElementById('batchImportConfirmBtn');
+        if (!modal || !input || !pasteBtn || !cancelBtn || !confirmBtn) {
+            return;
+        }
+        batchImportInputEl = input;
+
+        const closeModal = () => {
+            modal.classList.remove('active');
+            input.value = '';
+        };
+
+        const openModal = () => {
+            modal.classList.add('active');
+            input.value = '';
+            input.focus();
+        };
+
+        batchImportBtn && batchImportBtn.addEventListener('click', openModal);
+        modal.querySelector('.modal-close')?.addEventListener('click', closeModal);
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) {
+                closeModal();
+            }
+        });
+
+        pasteBtn.addEventListener('click', () => {
+            vscode.postMessage({ type: 'requestClipboardText' });
+        });
+        cancelBtn.addEventListener('click', closeModal);
+        confirmBtn.addEventListener('click', () => {
+            const names = input.value
+                .split(/\r?\n/)
+                .map(line => line.trim())
+                .filter(Boolean);
+            if (names.length === 0) {
+                return;
+            }
+            vscode.postMessage({ type: 'batchImportFilesByNames', names });
+            closeModal();
+        });
     }
 
     function renderMcpList() {

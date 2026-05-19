@@ -194,6 +194,12 @@ body {
     color: var(--vscode-editor-background);
 }
 
+.file-list-actions {
+    gap: 8px;
+    justify-content: flex-start;
+    flex-wrap: wrap;
+}
+
 /* Paste Path Section */
 .paste-path-section {
     margin-bottom: 8px;
@@ -995,6 +1001,20 @@ input.form-control::placeholder {
 
 .add-site-form .form-actions .btn-secondary:hover {
     background: var(--vscode-secondaryButton-hoverBackground);
+}
+
+.batch-import-form {
+    display: block;
+}
+
+.batch-import-input {
+    width: 100%;
+    min-height: 160px;
+    resize: vertical;
+}
+
+.batch-import-form .form-actions {
+    margin-top: 14px;
 }
 
 .add-site-form .form-actions .btn-danger {

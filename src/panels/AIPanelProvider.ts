@@ -593,6 +593,18 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
                 case 'selectFilesFromWorkspace':
                     await this._selectFilesFromWorkspace();
                     break;
+                case 'requestClipboardText':
+                    if (this._view) {
+                        const clipboardText = await vscode.env.clipboard.readText();
+                        this._view.webview.postMessage({
+                            type: 'clipboardText',
+                            text: clipboardText
+                        });
+                    }
+                    break;
+                case 'batchImportFilesByNames':
+                    await this._batchImportFilesByNames(data.names || []);
+                    break;
                 case 'dropFiles':
                     await this._handleDroppedFiles(data.files || data.uris || []);
                     break;
@@ -788,7 +800,7 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
     }
 
     // 添加文件引用 - 修复：相同文件不同行号时合并
-    public addFileReference(reference: FileReference) {
+    public addFileReference(reference: FileReference, options?: { silent?: boolean }) {
         // 检查是否已存在相同文件路径（根据 path 而非 id）
         let existingRef: FileReference | undefined;
         for (const ref of this._fileReferences.values()) {
@@ -806,9 +818,11 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
             // 合并行号（使用 Set 去重）
             const mergedLines = new Set([...existingLines, ...newLines]);
 
-            // 更新内容 - 如果新引用是选中内容，追加到后面
+            // 更新内容 - 文件引用优先覆盖为完整文件内容
             let mergedContent = existingRef.content;
-            if (reference.type === 'selection' && reference.content !== existingRef.content) {
+            if (reference.type === 'file') {
+                mergedContent = reference.content;
+            } else if (reference.type === 'selection' && reference.content !== existingRef.content) {
                 mergedContent += '\n\n// --- 额外选中内容 ---\n' + reference.content;
             }
 
@@ -818,10 +832,15 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
             // 更新引用
             existingRef.lineRange = mergedLineRange;
             existingRef.content = mergedContent;
+            if (reference.type === 'file') {
+                existingRef.type = 'file';
+            }
 
-            vscode.window.showInformationMessage(
-                `已合并到现有文件: ${reference.name} (行号: ${mergedLineRange})`
-            );
+            if (!options?.silent) {
+                vscode.window.showInformationMessage(
+                    `已合并到现有文件: ${reference.name} (行号: ${mergedLineRange})`
+                );
+            }
         } else {
             // 新文件，直接添加（使用 id 作为 key）
             this._fileReferences.set(reference.id, reference);
@@ -1006,6 +1025,50 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
         }
 
         return result;
+    }
+
+    private async _importFileFromUri(fileUri: vscode.Uri, options?: { silent?: boolean }): Promise<boolean> {
+        try {
+            const filePath = path.normalize(fileUri.fsPath);
+            if (!fs.existsSync(filePath)) {
+                return false;
+            }
+
+            const stats = fs.statSync(filePath);
+            if (!stats.isFile()) {
+                return false;
+            }
+
+            const fileName = path.basename(filePath);
+            try {
+                const document = await vscode.workspace.openTextDocument(fileUri);
+                const content = document.getText();
+                const totalLines = document.lineCount;
+
+                this.addFileReference({
+                    id: filePath,
+                    path: filePath,
+                    name: fileName,
+                    lineRange: `1-${totalLines}`,
+                    content,
+                    type: 'file'
+                }, options);
+            } catch {
+                this.addFileReference({
+                    id: filePath,
+                    path: filePath,
+                    name: fileName,
+                    lineRange: 'binary',
+                    content: `[二进制文件: ${fileName}]`,
+                    type: 'file'
+                }, options);
+            }
+
+            return true;
+        } catch (error) {
+            console.log(`无法导入文件: ${fileUri.fsPath}`, error);
+            return false;
+        }
     }
 
     // 复制到剪贴板 - 使用用户编辑后的内容
@@ -1647,23 +1710,10 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
         let addedCount = 0;
         for (const filePath of filePaths) {
             try {
-                // 转换为 VS Code URI
                 const fileUri = vscode.Uri.file(filePath);
-                // 检查是否是文本文件
-                const document = await vscode.workspace.openTextDocument(fileUri);
-                const content = document.getText();
-                const fileName = filePath.split(/[\\/]/).pop() || filePath;
-                const totalLines = document.lineCount;
-
-                this.addFileReference({
-                    id: filePath,
-                    path: filePath,
-                    name: fileName,
-                    lineRange: `1-${totalLines}`,
-                    content: content,
-                    type: 'file'
-                });
-                addedCount++;
+                if (await this._importFileFromUri(fileUri)) {
+                    addedCount++;
+                }
             } catch (error) {
                 // 跳过无法读取的文件（可能是二进制文件）
                 console.log(`无法读取文件: ${filePath}`, error);
@@ -1687,29 +1737,59 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
         });
 
         if (files && files.length > 0) {
+            let addedCount = 0;
             for (const fileUri of files) {
-                // 读取文件并添加到引用列表
                 try {
-                    const document = await vscode.workspace.openTextDocument(fileUri);
-                    const content = document.getText();
-                    const filePath = fileUri.fsPath;
-                    const fileName = filePath.split(/[\\/]/).pop() || filePath;
-                    const totalLines = document.lineCount;
-
-                    this.addFileReference({
-                        id: filePath,
-                        path: filePath,
-                        name: fileName,
-                        lineRange: `1-${totalLines}`,
-                        content: content,
-                        type: 'file'
-                    });
+                    if (await this._importFileFromUri(fileUri)) {
+                        addedCount++;
+                    }
                 } catch (error) {
                     vscode.window.showErrorMessage(`无法读取文件: ${error}`);
                 }
             }
-            vscode.window.showInformationMessage(`已添加 ${files.length} 个文件`);
+            if (addedCount > 0) {
+                vscode.window.showInformationMessage(`已添加 ${addedCount} 个文件`);
+            }
         }
+    }
+
+    private async _batchImportFilesByNames(fileNames: string[]): Promise<void> {
+        const uniqueNames = Array.from(
+            new Set(
+                (fileNames || [])
+                    .map(name => String(name).trim())
+                    .filter(name => !!name)
+            )
+        );
+
+        if (uniqueNames.length === 0) {
+            vscode.window.showWarningMessage('请输入至少一个文件名');
+            return;
+        }
+
+        const matchedFiles = new Map<string, vscode.Uri>();
+        const exclude = '{**/node_modules/**,**/.git/**,**/dist/**,**/build/**}';
+
+        for (const fileName of uniqueNames) {
+            const uris = await vscode.workspace.findFiles(`**/${fileName}`, exclude);
+            for (const uri of uris) {
+                matchedFiles.set(uri.fsPath, uri);
+            }
+        }
+
+        if (matchedFiles.size === 0) {
+            vscode.window.showWarningMessage(`未找到匹配文件: ${uniqueNames.slice(0, 5).join(', ')}${uniqueNames.length > 5 ? '...' : ''}`);
+            return;
+        }
+
+        let importedCount = 0;
+        for (const fileUri of matchedFiles.values()) {
+            if (await this._importFileFromUri(fileUri, { silent: true })) {
+                importedCount++;
+            }
+        }
+
+        vscode.window.showInformationMessage(`已批量导入 ${importedCount} 个文件引用`);
     }
 
     // 通过路径添加文件（支持绝对路径和相对路径）
@@ -1853,6 +1933,10 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
                 <span class="icon">+</span>
                 从工作区选择
             </button>
+            <button id="batchImportBtn" class="btn-select-files">
+                <span class="icon">🔍</span>
+                批量导入
+            </button>
         </div>
 
         <div class="paste-path-section">
@@ -1987,6 +2071,28 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
                     <div class="form-actions">
                         <button id="cancelAddMcpBtn" class="btn-secondary">取消</button>
                         <button id="confirmAddMcpBtn" class="btn-primary">确定</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="batchImportModal" class="modal-overlay">
+        <div class="modal-container">
+            <div class="modal-header">
+                <h3>批量导入</h3>
+                <button class="modal-close" title="关闭">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="add-site-form batch-import-form" style="display:block;">
+                    <div class="form-group">
+                        <label for="batchImportInput">文件名</label>
+                        <textarea id="batchImportInput" class="form-control batch-import-input" rows="8" placeholder="每一行输入一个文件名"></textarea>
+                    </div>
+                    <div class="form-actions">
+                        <button id="batchImportPasteBtn" class="btn-secondary">粘贴</button>
+                        <button id="batchImportCancelBtn" class="btn-secondary">取消</button>
+                        <button id="batchImportConfirmBtn" class="btn-primary">确认</button>
                     </div>
                 </div>
             </div>

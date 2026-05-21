@@ -1159,12 +1159,6 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
                 return false;
             }
 
-            await this._sleep(300);
-            const submitted = await this._trySubmitInputWithMcp(client, tools, instruction);
-            if (!submitted) {
-                return false;
-            }
-
             return true;
         } catch (error) {
             console.error('MCP browser automation failed for server: ' + serverName, error);
@@ -1221,74 +1215,80 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
     }
 
     private async _tryFillInputWithMcp(client: StdioMcpClient, tools: McpToolInfo[], instruction: string): Promise<boolean> {
-        const script = [
-            '(function(){',
-            'const text = ' + JSON.stringify(instruction) + ';',
-            'const candidates = Array.from(document.querySelectorAll(\'textarea, [contenteditable="true"], input[type="text"]\'));',
-            'const visible = candidates.filter((el) => {',
-            '  const rect = el.getBoundingClientRect();',
-            '  const style = window.getComputedStyle(el);',
-            '  return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";',
-            '});',
-            'const target = visible[0] || candidates[0];',
-            'if (!target) { throw new Error("no-input"); }',
-            'const getValue = (el) => el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? el.value : (el.textContent || "");',
-            'target.focus();',
-            'if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {',
-            '  const proto = target instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;',
-            '  const descriptor = Object.getOwnPropertyDescriptor(proto, "value");',
-            '  if (descriptor && descriptor.set) { descriptor.set.call(target, text); } else { target.value = text; }',
-            '  target.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));',
-            '  target.dispatchEvent(new Event("change", { bubbles: true }));',
-            '} else {',
-            '  target.textContent = text;',
-            '  target.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));',
-            '}',
-            'if (getValue(target) !== text) { throw new Error("input-not-complete"); }',
-            'return { ok: true };',
-            '})()'
-        ].join('');
+        const evaluateToolName = tools
+            .map(tool => tool.name)
+            .find(name => /(evaluate|script|javascript|execute)/i.test(name));
 
-        if (await this._tryEvaluateWithMcp(client, tools, script)) {
-            return true;
+        if (evaluateToolName) {
+            const script = [
+                '(function(){',
+                'const text = ' + JSON.stringify(instruction) + ';',
+                'const candidates = Array.from(document.querySelectorAll(\'textarea, [contenteditable="true"], input[type="text"]\'));',
+                'const visible = candidates.filter((el) => {',
+                '  const rect = el.getBoundingClientRect();',
+                '  const style = window.getComputedStyle(el);',
+                '  return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";',
+                '});',
+                'const target = visible[0] || candidates[0];',
+                'if (!target) { throw new Error("no-input"); }',
+                'const getValue = (el) => el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? el.value : (el.textContent || "");',
+                'if (getValue(target) === text) { return { ok: true, skipped: true }; }',
+                'target.focus();',
+                'if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {',
+                '  const proto = target instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;',
+                '  const descriptor = Object.getOwnPropertyDescriptor(proto, "value");',
+                '  if (descriptor && descriptor.set) { descriptor.set.call(target, text); } else { target.value = text; }',
+                '  target.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));',
+                '  target.dispatchEvent(new Event("change", { bubbles: true }));',
+                '} else {',
+                '  target.textContent = text;',
+                '  target.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));',
+                '}',
+                'return { ok: true };',
+                '})()'
+            ].join('');
+
+            for (const args of [
+                { script },
+                { expression: script },
+                { code: script },
+                { function: script }
+            ]) {
+                try {
+                    await client.callTool(evaluateToolName, args);
+                    return true;
+                } catch {
+                    // Try the next common argument shape.
+                }
+            }
+
+            return false;
         }
 
-        const fillToolNames = tools
+        const fillToolName = tools
             .map(tool => tool.name)
-            .filter(name => /(fill|type|insert|input|paste|set.?value)/i.test(name));
+            .find(name => /(fill|type|insert|input|paste|set.?value)/i.test(name));
 
-        const selectors = [
-            'textarea',
-            'textarea:not([disabled])',
-            '[contenteditable="true"]',
-            'div[contenteditable="true"]',
-            'input[type="text"]'
-        ];
+        if (!fillToolName) {
+            return false;
+        }
 
-        for (const toolName of fillToolNames) {
-            for (const selector of selectors) {
-                const argumentGuesses: Array<Record<string, unknown>> = [
-                    { selector, text: instruction },
-                    { selector, value: instruction },
-                    { selector, input: instruction },
-                    { element: selector, text: instruction },
-                    { element: selector, value: instruction }
-                ];
-
-                for (const args of argumentGuesses) {
-                    try {
-                        await client.callTool(toolName, args);
-                        if (await this._waitForMcpInputToMatch(client, tools, instruction)) {
-                            return true;
-                        }
-                    } catch {
-                        // Try next argument shape.
-                    }
-                }
+        for (const args of [
+            { selector: 'textarea, [contenteditable="true"], input[type="text"]', text: instruction },
+            { selector: 'textarea, [contenteditable="true"], input[type="text"]', value: instruction },
+            { element: 'textarea, [contenteditable="true"], input[type="text"]', text: instruction },
+            { element: 'textarea, [contenteditable="true"], input[type="text"]', value: instruction }
+        ]) {
+            try {
+                await client.callTool(fillToolName, args);
+                return true;
+            } catch {
+                // Try the next common argument shape once.
             }
         }
 
         return false;
+
     }
 
     private async _waitForMcpInputToMatch(client: StdioMcpClient, tools: McpToolInfo[], instruction: string): Promise<boolean> {
@@ -1767,13 +1767,34 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
             return;
         }
 
+        const exclude = '{**/node_modules/**,**/.git/**,**/dist/**,**/build/**,**/.ai/**}';
+        const matchesByName = new Map<string, vscode.Uri[]>();
         const matchedFiles = new Map<string, vscode.Uri>();
-        const exclude = '{**/node_modules/**,**/.git/**,**/dist/**,**/build/**}';
 
         for (const fileName of uniqueNames) {
             const uris = await vscode.workspace.findFiles(`**/${fileName}`, exclude);
-            for (const uri of uris) {
+            const filteredUris = uris.filter(uri => !this._isAiGeneratedPath(uri.fsPath));
+            matchesByName.set(fileName, filteredUris);
+            for (const uri of filteredUris) {
                 matchedFiles.set(uri.fsPath, uri);
+            }
+        }
+
+        const duplicateMatches = Array.from(matchesByName.entries()).filter(([, uris]) => uris.length > 1);
+        if (duplicateMatches.length > 0) {
+            const duplicateSummary = duplicateMatches
+                .slice(0, 10)
+                .map(([name, uris]) => `${name} (${uris.length})`)
+                .join(', ');
+            const continueImport = await vscode.window.showWarningMessage(
+                `发现多个同名文件：${duplicateSummary}。是否继续导入全部匹配项？`,
+                { modal: true },
+                '继续导入',
+                '取消'
+            );
+
+            if (continueImport !== '继续导入') {
+                return;
             }
         }
 
@@ -1790,6 +1811,11 @@ export class AIPanelProvider implements vscode.WebviewViewProvider {
         }
 
         vscode.window.showInformationMessage(`已批量导入 ${importedCount} 个文件引用`);
+    }
+
+    private _isAiGeneratedPath(filePath: string): boolean {
+        const normalizedPath = path.normalize(filePath);
+        return normalizedPath.split(path.sep).some(segment => segment.toLowerCase() === '.ai');
     }
 
     // 通过路径添加文件（支持绝对路径和相对路径）
